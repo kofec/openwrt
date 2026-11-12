@@ -133,6 +133,22 @@
 				<1320000 15>;
 	};
 
+	/*
+	 * Zasilanie 5 V gniazd USB: GPIOD_9 = bank GPIO2 bit 25, stan wysoki =
+	 * włączone (vendor: gpio-vbus-power przy porcie A). Ta sama linia
+	 * zasila gniazdo portu A i gniazda za hubem portu B - sprawdzone na
+	 * sprzęcie: przy stanie niskim odłączają się pendrive'y z obu.
+	 */
+	usb_vbus: regulator-usb-vbus {
+		compatible = "regulator-fixed";
+		regulator-name = "USB_VBUS";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		gpio = <&gpio_c 25 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-always-on;
+	};
+
 	/* Wi-Fi AP6210: zasilanie GPIOC_7 (bank GPIO2 bit 7), wysoki = włączone. */
 	wifi_pwrseq: wifi-pwrseq {
 		compatible = "mmc-pwrseq-simple";
@@ -329,7 +345,7 @@
  *
  * PHY portu B wykrywa zegar dopiero, gdy PHY portu A (USB_ADDR0 = 0x8400)
  * jest wyjęty z resetu (sprawdzone devmem 2026-11-11), dlatego port A też
- * jest włączony, choć jego VBUS (GPIOD_9) nie jest jeszcze sterowany.
+ * jest włączony. Jego zasilanie załącza regulator usb_vbus (GPIOD_9).
  */
 &usb0_phy {
 	compatible = "amlogic,meson6-usb2-phy", "amlogic,meson-mx-usb2-phy";
@@ -365,11 +381,9 @@
 
 /*
  * Jeszcze nie zrobione:
- *  - zasilanie VBUS portu A (OTG) na GPIOD_9.
- *  - zegar 32 kHz dla Wi-Fi: HHI_GEN_CLK_CNTL2 (0xc110422c) = 0x00600000,
- *    na razie ustawiany poza jądrem (brak sterownika zegarów).
- *  - Diody (power, wifi, eth), pilot IR, drugi rdzeń CPU.
+ *  - diody (power, wifi, eth) i pilot IR,
  *  - NAND 0xc1108600: brak sterownika w mainline.
+ * Zegar 32 kHz dla Wi-Fi (HHI_GEN_CLK_CNTL2) okazał się niepotrzebny.
  */
 
 /*
