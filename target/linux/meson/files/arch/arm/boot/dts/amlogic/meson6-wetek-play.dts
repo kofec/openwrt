@@ -1,0 +1,398 @@
+// SPDX-License-Identifier: GPL-2.0 OR MIT
+/*
+ * WeTek Play (pierwsza wersja, AML8726-MX / Meson6) - minimalny DTS
+ * pod mainline 6.12 do pierwszego startu z konsolą szeregową.
+ *
+ * NIETESTOWANE NA SPRZĘCIE. Dane płytki pochodzą z vendorskiego
+ * arch/arm/boot/dts/amlogic/wetek_play.dtd (LibreELEC/linux-amlogic
+ * 95ba9d626c0f, jądro 3.10.108).
+ *
+ * Mainline nie ma dla Meson6 sterownika zegarów ani pinctrl, więc:
+ *  - zegary są atrapami (fixed-clock); bramki musi zostawić włączone U-Boot,
+ *  - multipleksowanie pinów też zostaje po U-Boocie.
+ * Dlatego start najlepiej robić z karty SD: wtedy U-Boot sam ustawia piny
+ * i zegar kontrolera SD.
+ */
+
+/dts-v1/;
+#include <dt-bindings/clock/meson8b-clkc.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/reset/amlogic,meson8b-reset.h>
+#include "meson6.dtsi"
+
+/ {
+	model = "WeTek Play";
+	compatible = "wetek,play", "amlogic,meson6";
+
+	aliases {
+		serial0 = &uart_AO;
+		ethernet0 = &ethmac;
+		mmc0 = &sd_slot;
+		mmc1 = &wifi_slot;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	/* Drugi rdzeń: łatka 0002, metoda "amlogic,meson6-smp". */
+	cpus {
+		enable-method = "amlogic,meson6-smp";
+
+		cpu@200 {
+			clocks = <&clkc CLKID_CPUCLK>;
+			operating-points-v2 = <&cpu_opp_table>;
+			clock-latency = <200000>;
+			cpu-supply = <&vcck>;
+		};
+
+		cpu@201 {
+			clocks = <&clkc CLKID_CPUCLK>;
+			operating-points-v2 = <&cpu_opp_table>;
+			clock-latency = <200000>;
+			cpu-supply = <&vcck>;
+		};
+	};
+
+	/*
+	 * Tylko dzielniki /3, /2, /1 za PLL-em systemowym ustawionym przez
+	 * U-Boota na 1200 MHz; samego PLL-a nie ruszamy. Napięcia rdzenia wg
+	 * tabeli dvfs vendora (do 792 MHz: 1,01 V, 1200 MHz: 1,24 V).
+	 */
+	cpu_opp_table: opp-table {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+			opp-microvolt = <1010000>;
+		};
+
+		opp-600000000 {
+			opp-hz = /bits/ 64 <600000000>;
+			opp-microvolt = <1010000>;
+		};
+
+		opp-1200000000 {
+			opp-hz = /bits/ 64 <1200000000>;
+			opp-microvolt = <1240000>;
+		};
+	};
+
+	/* vendor: phys_offset 0x80000000, linux,total-memory 0x40000000 */
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x80000000 0x40000000>;
+	};
+
+	/* Zasilanie karty: CARD_8 (bank GPIO5 bit 31), aktywne stanem niskim. */
+	vcc_card: regulator-vcc-card {
+		compatible = "regulator-fixed";
+		regulator-name = "VCC_CARD";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&gpio_card 31 GPIO_ACTIVE_LOW>;
+		startup-delay-us = <100000>;
+	};
+
+	/*
+	 * Napięcie rdzenia CPU (VCCK) ustawiane wypełnieniem PWM_C na GPIOD_0.
+	 * Tabela z vendorskiego cs_voltage_table: wartość rejestru PWM to
+	 * (hi << 16) | lo przy hi + lo = 28 taktach zegara 24 MHz. Procenty
+	 * dobrane tak, żeby sterownik wyliczył dokładnie te same hi (19..4).
+	 */
+	vcck: regulator-vcck {
+		compatible = "pwm-regulator";
+		regulator-name = "VCCK";
+		pwms = <&pwm_cd 0 1167 0>;
+		regulator-min-microvolt = <1010000>;
+		regulator-max-microvolt = <1320000>;
+		regulator-boot-on;
+		regulator-always-on;
+		/*
+		 * U-Boot nie programuje PWM, więc bez tego rdzeń dostałby na
+		 * starcie najniższe napięcie przy pełnej częstotliwości
+		 * (łatka 0006). 1,32 V to wartość startowa vendora.
+		 */
+		regulator-init-microvolt = <1320000>;
+		voltage-table = <1010000 68>,
+				<1050000 65>,
+				<1070000 61>,
+				<1090000 58>,
+				<1110000 54>,
+				<1130000 51>,
+				<1150000 47>,
+				<1170000 43>,
+				<1190000 40>,
+				<1210000 36>,
+				<1220000 33>,
+				<1240000 29>,
+				<1270000 26>,
+				<1280000 22>,
+				<1300000 18>,
+				<1320000 15>;
+	};
+
+	/* Wi-Fi AP6210: zasilanie GPIOC_7 (bank GPIO2 bit 7), wysoki = włączone. */
+	wifi_pwrseq: wifi-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		reset-gpios = <&gpio_c 7 GPIO_ACTIVE_LOW>;
+		post-power-on-delay-ms = <200>;
+	};
+
+	vcc_wifi: regulator-vcc-wifi {
+		compatible = "regulator-fixed";
+		regulator-name = "VCC_WIFI";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+};
+
+/*
+ * Rozwiązanie tymczasowe zamiast sterownika pinctrl/GPIO Meson6: ogólne
+ * sterowniki jądra na surowych rejestrach (potwierdzone devmem 2026-11-11).
+ */
+&cbus {
+	/* PREG_PAD_GPIO5: EN_N 0x201b, O 0x201c, I 0x201d (rejestr * 4) */
+	gpio_card: gpio@8074 {
+		compatible = "wd,mbl-gpio";
+		reg = <0x8074 0x4>, <0x8070 0x4>, <0x806c 0x4>;
+		reg-names = "dat", "set", "dirin";
+		#gpio-cells = <2>;
+		gpio-controller;
+	};
+
+	/* PREG_PAD_GPIO2 (GPIOC): EN_N 0x2012, O 0x2013, I 0x2014 */
+	gpio_c: gpio@8050 {
+		compatible = "wd,mbl-gpio";
+		reg = <0x8050 0x4>, <0x804c 0x4>, <0x8048 0x4>;
+		reg-names = "dat", "set", "dirin";
+		#gpio-cells = <2>;
+		gpio-controller;
+	};
+
+	/* RESET0..7_REGISTER od 0x1101: ten sam układ co w Meson8b */
+	reset: reset-controller@4404 {
+		compatible = "amlogic,meson8b-reset";
+		reg = <0x4404 0x9c>;
+		#reset-cells = <1>;
+	};
+
+	/* PERIPHS_PIN_MUX_0..9 od 0x202c, jeden bit na funkcję */
+	pinmux: pinmux@80b0 {
+		compatible = "pinctrl-single";
+		reg = <0x80b0 0x28>;
+		#pinctrl-cells = <2>;
+		pinctrl-single,bit-per-mux;
+		pinctrl-single,register-width = <32>;
+		pinctrl-single,function-mask = <0x1>;
+
+		/* SD port B na CARD_0..5: PIN_MUX_2 bity 15..10; SDHC B (7..4) wyłączone */
+		sd_b_pins: sd-b-pins {
+			pinctrl-single,bits = <0x8 0x0000fc00 0x0000fcf0>;
+		};
+
+		/* PWM_C na GPIOD_0: PIN_MUX_2 bit 2, PIN_MUX_1 bit 29 wyłączony */
+		pwm_c_pins: pwm-c-pins {
+			pinctrl-single,bits = <0x08 0x00000004 0x00000004>,
+					      <0x04 0x00000000 0x20000000>;
+		};
+
+		/*
+		 * SDIO port A na GPIOX_0..3, 8, 9: PIN_MUX_8 bity 5..0 oraz
+		 * zegar 32 kHz dla Wi-Fi na GPIOX_12: PIN_MUX_3 bit 21.
+		 */
+		sdio_a_pins: sdio-a-pins {
+			pinctrl-single,bits = <0x20 0x0000003f 0x0000003f>,
+					      <0x0c 0x00200000 0x00200000>;
+		};
+	};
+};
+
+/*
+ * SMP: vendor wpisuje adres startu drugiego rdzenia pod AHB SRAM + 0x1ff84
+ * i ustawia bit rdzenia w rejestrze + 0x1ff80 (ten sam układ co Meson8).
+ */
+&ahb_sram {
+	smp-sram@1ff80 {
+		compatible = "amlogic,meson6-smp-sram";
+		reg = <0x1ff80 0x8>;
+	};
+};
+
+&periph {
+	scu@0 {
+		compatible = "arm,cortex-a9-scu";
+		reg = <0x0 0x100>;
+	};
+
+	/*
+	 * Prywatny timer każdego rdzenia (TWD), taktowany zegarem CPU / 4.
+	 * Zegar musi być opisany, żeby timer przeliczał się przy zmianie
+	 * częstotliwości procesora.
+	 */
+	timer@600 {
+		compatible = "arm,cortex-a9-twd-timer";
+		reg = <0x600 0x20>;
+		interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(2) | IRQ_TYPE_EDGE_RISING)>;
+		clocks = <&clkc CLKID_PERIPH>;
+	};
+};
+
+/*
+ * Sterownik zegarów Meson6 (łatka 0004): opisuje PLL-e i zegar CPU tak, jak
+ * zostawił je U-Boot (tylko odczyt), i steruje bramkami urządzeń. Identyfikatory
+ * zegarów wzięte z bindingu Meson8b.
+ */
+&hhi {
+	clkc: clock-controller {
+		compatible = "amlogic,meson6-clkc";
+		clocks = <&xtal>;
+		clock-names = "xtal";
+		#clock-cells = <1>;
+	};
+};
+
+/* Konsola na złączu RS-232; vendor: uart_ao, 115200 */
+&uart_AO {
+	status = "okay";
+};
+
+/*
+ * Ethernet 10/100, PHY SMSC LAN8720A po RMII.
+ * Zegar 50 MHz RMII przychodzi z zewnątrz na pin (vendor: CLK_RMII_FROM_PAD),
+ * więc nie wymaga PLL. Piny GPIOY_2..14 (mux reg 6) muszą zostać po U-Boocie.
+ * Bez węzła mdio stmmac sam przeszukuje szynę MDIO.
+ */
+&ethmac {
+	status = "okay";
+	phy-mode = "rmii";
+	clocks = <&clkc CLKID_ETH>;
+	clock-names = "stmmaceth";
+};
+
+/*
+ * Gniazdo microSD: vendor port = <1> (sdio_b), 4 bity, do 50 MHz.
+ * Ten sam kontroler obsługuje też Wi-Fi na porcie A (slot@0); dwa gniazda
+ * naraz i nazwę "amlogic,meson6-sdio" daje łatka 0003.
+ * Wykrywanie karty: CARD_6 (bit 29), stan niski = karta w gnieździe; bez
+ * przerwania, więc jądro odpytuje pin.
+ */
+&sdio {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&sd_b_pins>, <&sdio_a_pins>;
+	compatible = "amlogic,meson6-sdio", "amlogic,meson-mx-sdio";
+	clocks = <&clkc CLKID_SDIO>, <&clkc CLKID_CLK81>;
+	clock-names = "core", "clkin";
+
+	/* Wi-Fi AP6210 (BCM43362): vendor port = <0> (sdio_a) */
+	wifi_slot: slot@0 {
+		compatible = "mmc-slot";
+		reg = <0>;
+		bus-width = <4>;
+		max-frequency = <50000000>;
+		cap-sd-highspeed;
+		non-removable;
+		disable-wp;
+		vmmc-supply = <&vcc_wifi>;
+		mmc-pwrseq = <&wifi_pwrseq>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		wifi@1 {
+			compatible = "brcm,bcm4329-fmac";
+			reg = <1>;
+		};
+	};
+
+	sd_slot: slot@1 {
+		compatible = "mmc-slot";
+		reg = <1>;
+		bus-width = <4>;
+		max-frequency = <50000000>;
+		cap-sd-highspeed;
+		cap-mmc-highspeed;
+		disable-wp;
+		cd-gpios = <&gpio_card 29 GPIO_ACTIVE_LOW>;
+		vmmc-supply = <&vcc_card>;
+	};
+};
+
+/*
+ * USB port B (vendor: usb_b, host, za nim hub 4-portowy). PHY ma ten sam
+ * układ rejestrów co Meson8 (config/ctrl, fsel, POR), ale:
+ *  - leży pod USB_ADDR8 = 0x2108 -> 0x8420 (w Meson8: 0x8820),
+ *  - zegar referencyjny trzeba włączyć samemu (łatka 0001, "meson6-usb2-phy").
+ * Reset to RESET1 bit 2. Zegary to atrapy: bramki zostawia włączone U-Boot.
+ *
+ * PHY portu B wykrywa zegar dopiero, gdy PHY portu A (USB_ADDR0 = 0x8400)
+ * jest wyjęty z resetu (sprawdzone devmem 2026-11-11), dlatego port A też
+ * jest włączony, choć jego VBUS (GPIOD_9) nie jest jeszcze sterowany.
+ */
+&usb0_phy {
+	compatible = "amlogic,meson6-usb2-phy", "amlogic,meson-mx-usb2-phy";
+	reg = <0x8400 0x20>;
+	clocks = <&clkc CLKID_USB>, <&clkc CLKID_USB0>;
+	clock-names = "usb_general", "usb";
+	resets = <&reset RESET_USB_OTG>;
+	status = "okay";
+};
+
+&usb0 {
+	compatible = "amlogic,meson8-usb", "snps,dwc2";
+	clocks = <&clkc CLKID_USB0_DDR_BRIDGE>;
+	clock-names = "otg";
+	status = "okay";
+};
+
+&usb1_phy {
+	compatible = "amlogic,meson6-usb2-phy", "amlogic,meson-mx-usb2-phy";
+	reg = <0x8420 0x20>;
+	clocks = <&clkc CLKID_USB>, <&clkc CLKID_USB1>;
+	clock-names = "usb_general", "usb";
+	resets = <&reset RESET_USB_OTG>;
+	status = "okay";
+};
+
+&usb1 {
+	compatible = "amlogic,meson8-usb", "snps,dwc2";
+	clocks = <&clkc CLKID_USB1_DDR_BRIDGE>;
+	clock-names = "otg";
+	status = "okay";
+};
+
+/*
+ * Jeszcze nie zrobione:
+ *  - zasilanie VBUS portu A (OTG) na GPIOD_9.
+ *  - zegar 32 kHz dla Wi-Fi: HHI_GEN_CLK_CNTL2 (0xc110422c) = 0x00600000,
+ *    na razie ustawiany poza jądrem (brak sterownika zegarów).
+ *  - Diody (power, wifi, eth), pilot IR, drugi rdzeń CPU.
+ *  - NAND 0xc1108600: brak sterownika w mainline.
+ */
+
+/*
+ * Przetwornik SAR ADC z czujnikiem temperatury SoC (łatka 0005,
+ * "amlogic,meson6-saradc"). Kanał 8 trafia do iio-hwmon z meson.dtsi, więc
+ * temperatura jest w /sys/class/hwmon. Przeliczenie wg wzoru vendora, bez
+ * kalibracji - traktować jako przybliżone.
+ */
+&saradc {
+	compatible = "amlogic,meson6-saradc", "amlogic,meson-saradc";
+	clocks = <&xtal>, <&clkc CLKID_SAR_ADC>;
+	clock-names = "clkin", "core";
+	status = "okay";
+};
+
+/*
+ * PWM_C/D. Tylko kwarc jako źródło zegara, żeby wartości rejestru były takie
+ * same jak u vendora (28 taktów na okres).
+ */
+&pwm_cd {
+	compatible = "amlogic,meson8-pwm-v2", "amlogic,meson-pwm";
+	clocks = <&xtal>, <0>, <0>, <0>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pwm_c_pins>;
+	status = "okay";
+};

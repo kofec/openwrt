@@ -1,0 +1,7 @@
+# Dane Dockera muszą leżeć na prawdziwym systemie plików. Domyślne /opt/docker
+# jest na nakładce overlayfs OpenWrt i kontenery nie startują
+# ("failed to mount ... overlay"). /overlay to bezpośrednio partycja f2fs.
+[ -f /etc/config/dockerd ] || exit 0
+uci -q set dockerd.globals.data_root='/overlay/docker'
+uci -q commit dockerd
+exit 0

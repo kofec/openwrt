@@ -1,0 +1,12 @@
+# WeTek Play: MAC Ethernetu z U-Boota (zmienna ethaddr trafia do linii poleceń
+# jako mac=xx:xx:xx:xx:xx:xx). Bez tego stmmac losuje adres przy każdym starcie
+# z karty, bo U-Boot nie inicjalizuje wtedy Ethernetu.
+
+wetek_set_mac() {
+	local mac
+
+	mac=$(sed -n 's/.*[ ]mac=\([0-9a-fA-F:]\{17\}\).*/\1/p' /proc/cmdline)
+	[ -n "$mac" ] && ip link set dev eth0 address "$mac"
+}
+
+boot_hook_add preinit_main wetek_set_mac
