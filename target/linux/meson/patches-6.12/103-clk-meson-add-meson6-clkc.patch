@@ -1,0 +1,538 @@
+--- a/drivers/clk/meson/Kconfig
++++ b/drivers/clk/meson/Kconfig
+@@ -52,6 +52,19 @@
+ 	tristate
+ 	select COMMON_CLK_MESON_REGMAP
+ 
++config COMMON_CLK_MESON6
++	bool "Meson6 SoC Clock controller support"
++	depends on ARM
++	default MACH_MESON6
++	select COMMON_CLK_MESON_REGMAP
++	select COMMON_CLK_MESON_CLKC_UTILS
++	select COMMON_CLK_MESON_PLL
++	select MFD_SYSCON
++	help
++	  Support for the clock controller on AmLogic AML8726-MX (Meson6)
++	  devices. Say Y if you want the peripheral clocks to be described
++	  and gated properly.
++
+ config COMMON_CLK_MESON8B
+ 	bool "Meson8 SoC Clock controller support"
+ 	depends on ARM
+--- a/drivers/clk/meson/Makefile
++++ b/drivers/clk/meson/Makefile
+@@ -24,6 +24,7 @@
+ obj-$(CONFIG_COMMON_CLK_C3_PERIPHERALS) += c3-peripherals.o
+ obj-$(CONFIG_COMMON_CLK_GXBB) += gxbb.o gxbb-aoclk.o
+ obj-$(CONFIG_COMMON_CLK_G12A) += g12a.o g12a-aoclk.o
++obj-$(CONFIG_COMMON_CLK_MESON6) += meson6.o
+ obj-$(CONFIG_COMMON_CLK_MESON8B) += meson8b.o meson8-ddr.o
+ obj-$(CONFIG_COMMON_CLK_S4_PLL) += s4-pll.o
+ obj-$(CONFIG_COMMON_CLK_S4_PERIPHERALS) += s4-peripherals.o
+--- /dev/null
++++ b/drivers/clk/meson/meson6.c
+@@ -0,0 +1,503 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Amlogic Meson6 (AML8726-MX) clock controller
++ *
++ * The register layout of the peripheral clock (clk81), the CPU clock mux and
++ * the gates is the same as on Meson8b. The PLLs live at different offsets.
++ * This driver describes the tree as it is left by the boot loader: the PLLs
++ * are read-only. The CPU clock can be switched between the outputs of the
++ * post dividers of the system PLL (/1, /2, /3) and the peripheral gates are
++ * controlled.
++ *
++ * The clock IDs of the Meson8b binding are reused.
++ */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/mfd/syscon.h>
++#include <linux/of.h>
++#include <linux/regmap.h>
++
++#include "clk-regmap.h"
++#include "clk-pll.h"
++#include "meson-clkc-utils.h"
++
++#include <dt-bindings/clock/meson8b-clkc.h>
++
++#define HHI_GCLK_MPEG0			0x140
++#define HHI_GCLK_MPEG1			0x144
++#define HHI_GCLK_MPEG2			0x148
++#define HHI_MPEG_CLK_CNTL		0x174
++#define HHI_SYS_CPU_CLK_CNTL		0x19c
++#define HHI_SYS_PLL_CNTL		0x260
++#define HHI_MPLL_CNTL			0x280
++
++static const struct clk_parent_data meson6_xtal = {
++	.fw_name = "xtal",
++	.name = "xtal",
++	.index = -1,
++};
++
++static struct clk_regmap meson6_fixed_pll_dco = {
++	.data = &(struct meson_clk_pll_data){
++		.en = {
++			.reg_off = HHI_MPLL_CNTL,
++			.shift   = 30,
++			.width   = 1,
++		},
++		.m = {
++			.reg_off = HHI_MPLL_CNTL,
++			.shift   = 0,
++			.width   = 9,
++		},
++		.n = {
++			.reg_off = HHI_MPLL_CNTL,
++			.shift   = 9,
++			.width   = 5,
++		},
++		.l = {
++			.reg_off = HHI_MPLL_CNTL,
++			.shift   = 31,
++			.width   = 1,
++		},
++		.rst = {
++			.reg_off = HHI_MPLL_CNTL,
++			.shift   = 29,
++			.width   = 1,
++		},
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "fixed_pll_dco",
++		.ops = &meson_clk_pll_ro_ops,
++		.parent_data = &meson6_xtal,
++		.num_parents = 1,
++	},
++};
++
++/*
++ * xtal * M / N gives 1000MHz with the values programmed by the boot loader
++ * while the vendor kernel reports 2000MHz and clk81 (fclk_div5 / 2) is known
++ * to be 200MHz. So the PLL output is twice the value of the M/N formula.
++ */
++static struct clk_fixed_factor meson6_fixed_pll = {
++	.mult = 2,
++	.div = 1,
++	.hw.init = &(struct clk_init_data){
++		.name = "fixed_pll",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_fixed_pll_dco.hw
++		},
++		.num_parents = 1,
++	},
++};
++
++#define MESON6_FCLK_DIV(_name, _div)					\
++static struct clk_fixed_factor meson6_##_name = {			\
++	.mult = 1,							\
++	.div = (_div),							\
++	.hw.init = &(struct clk_init_data){				\
++		.name = #_name,						\
++		.ops = &clk_fixed_factor_ops,				\
++		.parent_hws = (const struct clk_hw *[]) {		\
++			&meson6_fixed_pll.hw				\
++		},							\
++		.num_parents = 1,					\
++	},								\
++}
++
++MESON6_FCLK_DIV(fclk_div2, 2);
++MESON6_FCLK_DIV(fclk_div3, 3);
++MESON6_FCLK_DIV(fclk_div4, 4);
++MESON6_FCLK_DIV(fclk_div5, 5);
++MESON6_FCLK_DIV(fclk_div7, 7);
++
++static u32 meson6_mux_table_clk81[] = { 6, 5, 7 };
++
++static struct clk_regmap meson6_mpeg_clk_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_MPEG_CLK_CNTL,
++		.mask = 0x7,
++		.shift = 12,
++		.table = meson6_mux_table_clk81,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "mpeg_clk_sel",
++		.ops = &clk_regmap_mux_ro_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_fclk_div3.hw,
++			&meson6_fclk_div4.hw,
++			&meson6_fclk_div5.hw,
++		},
++		.num_parents = 3,
++	},
++};
++
++static struct clk_regmap meson6_mpeg_clk_div = {
++	.data = &(struct clk_regmap_div_data){
++		.offset = HHI_MPEG_CLK_CNTL,
++		.shift = 0,
++		.width = 7,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "mpeg_clk_div",
++		.ops = &clk_regmap_divider_ro_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_mpeg_clk_sel.hw
++		},
++		.num_parents = 1,
++	},
++};
++
++static struct clk_regmap meson6_clk81 = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_MPEG_CLK_CNTL,
++		.bit_idx = 7,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "clk81",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_mpeg_clk_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_IS_CRITICAL,
++	},
++};
++
++static struct clk_regmap meson6_sys_pll_dco = {
++	.data = &(struct meson_clk_pll_data){
++		.en = {
++			.reg_off = HHI_SYS_PLL_CNTL,
++			.shift   = 30,
++			.width   = 1,
++		},
++		.m = {
++			.reg_off = HHI_SYS_PLL_CNTL,
++			.shift   = 0,
++			.width   = 9,
++		},
++		.n = {
++			.reg_off = HHI_SYS_PLL_CNTL,
++			.shift   = 9,
++			.width   = 5,
++		},
++		.l = {
++			.reg_off = HHI_SYS_PLL_CNTL,
++			.shift   = 31,
++			.width   = 1,
++		},
++		.rst = {
++			.reg_off = HHI_SYS_PLL_CNTL,
++			.shift   = 29,
++			.width   = 1,
++		},
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "sys_pll_dco",
++		.ops = &meson_clk_pll_ro_ops,
++		.parent_data = &meson6_xtal,
++		.num_parents = 1,
++	},
++};
++
++static struct clk_regmap meson6_sys_pll = {
++	.data = &(struct clk_regmap_div_data){
++		.offset = HHI_SYS_PLL_CNTL,
++		.shift = 16,
++		.width = 2,
++		.flags = CLK_DIVIDER_POWER_OF_TWO,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "sys_pll",
++		.ops = &clk_regmap_divider_ro_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_sys_pll_dco.hw
++		},
++		.num_parents = 1,
++	},
++};
++
++/* bits 1:0 = 2 would select the DDR PLL which is not described here */
++static u32 meson6_mux_table_cpu_in[] = { 0, 1 };
++
++static struct clk_regmap meson6_cpu_in_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_SYS_CPU_CLK_CNTL,
++		.mask = 0x3,
++		.shift = 0,
++		.table = meson6_mux_table_cpu_in,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "cpu_in_sel",
++		.ops = &clk_regmap_mux_ro_ops,
++		.parent_data = (const struct clk_parent_data[]) {
++			{ .fw_name = "xtal", .name = "xtal", .index = -1, },
++			{ .hw = &meson6_sys_pll.hw, },
++		},
++		.num_parents = 2,
++	},
++};
++
++static struct clk_fixed_factor meson6_cpu_in_div2 = {
++	.mult = 1,
++	.div = 2,
++	.hw.init = &(struct clk_init_data){
++		.name = "cpu_in_div2",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_cpu_in_sel.hw
++		},
++		.num_parents = 1,
++	},
++};
++
++static struct clk_fixed_factor meson6_cpu_in_div3 = {
++	.mult = 1,
++	.div = 3,
++	.hw.init = &(struct clk_init_data){
++		.name = "cpu_in_div3",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_cpu_in_sel.hw
++		},
++		.num_parents = 1,
++	},
++};
++
++/* bits 3:2 = 3 would select a "/ (2 * N)" divider which is not described */
++static u32 meson6_mux_table_cpu_scale_out[] = { 0, 1, 2 };
++
++static struct clk_regmap meson6_cpu_scale_out_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_SYS_CPU_CLK_CNTL,
++		.mask = 0x3,
++		.shift = 2,
++		.table = meson6_mux_table_cpu_scale_out,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "cpu_scale_out_sel",
++		/*
++		 * No CLK_SET_RATE_PARENT: the rate is changed by selecting
++		 * another post divider, the system PLL itself is not touched.
++		 */
++		.ops = &clk_regmap_mux_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_cpu_in_sel.hw,
++			&meson6_cpu_in_div2.hw,
++			&meson6_cpu_in_div3.hw,
++		},
++		.num_parents = 3,
++	},
++};
++
++static struct clk_regmap meson6_cpu_clk = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_SYS_CPU_CLK_CNTL,
++		.mask = 0x1,
++		.shift = 7,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "cpu_clk",
++		.ops = &clk_regmap_mux_ops,
++		.parent_data = (const struct clk_parent_data[]) {
++			{ .fw_name = "xtal", .name = "xtal", .index = -1, },
++			{ .hw = &meson6_cpu_scale_out_sel.hw, },
++		},
++		.num_parents = 2,
++		.flags = (CLK_SET_RATE_PARENT |
++			  CLK_SET_RATE_NO_REPARENT |
++			  CLK_IS_CRITICAL),
++	},
++};
++
++/* clock of the private timers and the SCU, vendor: a9_clk / 4 */
++static struct clk_fixed_factor meson6_periph_clk = {
++	.mult = 1,
++	.div = 4,
++	.hw.init = &(struct clk_init_data){
++		.name = "periph_clk",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_cpu_clk.hw
++		},
++		.num_parents = 1,
++	},
++};
++
++/*
++ * Like on Meson8b the CPU is parked on the crystal while the post divider
++ * mux is changed, the vendor kernel does the same.
++ */
++static int meson6_cpu_clk_notifier_cb(struct notifier_block *nb,
++				      unsigned long event, void *data)
++{
++	struct clk_hw *parent_clk;
++	int ret;
++
++	switch (event) {
++	case PRE_RATE_CHANGE:
++		/* xtal */
++		parent_clk = clk_hw_get_parent_by_index(&meson6_cpu_clk.hw, 0);
++		break;
++
++	case POST_RATE_CHANGE:
++		/* cpu_scale_out_sel */
++		parent_clk = clk_hw_get_parent_by_index(&meson6_cpu_clk.hw, 1);
++		break;
++
++	default:
++		return NOTIFY_DONE;
++	}
++
++	ret = clk_hw_set_parent(&meson6_cpu_clk.hw, parent_clk);
++	if (ret)
++		return notifier_from_errno(ret);
++
++	udelay(100);
++
++	return NOTIFY_OK;
++}
++
++static struct notifier_block meson6_cpu_clk_nb = {
++	.notifier_call = meson6_cpu_clk_notifier_cb,
++};
++
++/* The gate bits are the same as on Meson8b (vendor: GCLK_IDX_*) */
++#define MESON6_GATE(_name, _reg, _bit) \
++	MESON_PCLK(_name, _reg, _bit, &meson6_clk81.hw)
++
++static MESON6_GATE(meson6_i2c, HHI_GCLK_MPEG0, 9);
++static MESON6_GATE(meson6_sar_adc, HHI_GCLK_MPEG0, 10);
++static MESON6_GATE(meson6_rng0, HHI_GCLK_MPEG0, 12);
++static MESON6_GATE(meson6_uart0, HHI_GCLK_MPEG0, 13);
++static MESON6_GATE(meson6_sdio, HHI_GCLK_MPEG0, 17);
++static MESON6_GATE(meson6_eth, HHI_GCLK_MPEG1, 3);
++static MESON6_GATE(meson6_uart1, HHI_GCLK_MPEG1, 16);
++static MESON6_GATE(meson6_usb0, HHI_GCLK_MPEG1, 21);
++static MESON6_GATE(meson6_usb1, HHI_GCLK_MPEG1, 22);
++static MESON6_GATE(meson6_usb, HHI_GCLK_MPEG1, 26);
++static MESON6_GATE(meson6_efuse, HHI_GCLK_MPEG1, 30);
++static MESON6_GATE(meson6_usb1_ddr_bridge, HHI_GCLK_MPEG2, 8);
++static MESON6_GATE(meson6_usb0_ddr_bridge, HHI_GCLK_MPEG2, 9);
++static MESON6_GATE(meson6_uart2, HHI_GCLK_MPEG2, 15);
++
++/* clocks which are not exposed through the DT binding, parents first */
++static struct clk_hw *meson6_internal_hws[] = {
++	&meson6_fixed_pll_dco.hw,
++	&meson6_sys_pll_dco.hw,
++	&meson6_cpu_in_sel.hw,
++	&meson6_cpu_in_div2.hw,
++	&meson6_cpu_in_div3.hw,
++	&meson6_cpu_scale_out_sel.hw,
++};
++
++static struct clk_hw *meson6_hw_clks[] = {
++	[CLKID_PLL_FIXED]		= &meson6_fixed_pll.hw,
++	[CLKID_PLL_SYS]			= &meson6_sys_pll.hw,
++	[CLKID_FCLK_DIV2]		= &meson6_fclk_div2.hw,
++	[CLKID_FCLK_DIV3]		= &meson6_fclk_div3.hw,
++	[CLKID_FCLK_DIV4]		= &meson6_fclk_div4.hw,
++	[CLKID_FCLK_DIV5]		= &meson6_fclk_div5.hw,
++	[CLKID_FCLK_DIV7]		= &meson6_fclk_div7.hw,
++	[CLKID_MPEG_SEL]		= &meson6_mpeg_clk_sel.hw,
++	[CLKID_MPEG_DIV]		= &meson6_mpeg_clk_div.hw,
++	[CLKID_CLK81]			= &meson6_clk81.hw,
++	[CLKID_CPUCLK]			= &meson6_cpu_clk.hw,
++	[CLKID_I2C]			= &meson6_i2c.hw,
++	[CLKID_SAR_ADC]			= &meson6_sar_adc.hw,
++	[CLKID_RNG0]			= &meson6_rng0.hw,
++	[CLKID_UART0]			= &meson6_uart0.hw,
++	[CLKID_SDIO]			= &meson6_sdio.hw,
++	[CLKID_ETH]			= &meson6_eth.hw,
++	[CLKID_UART1]			= &meson6_uart1.hw,
++	[CLKID_USB0]			= &meson6_usb0.hw,
++	[CLKID_USB1]			= &meson6_usb1.hw,
++	[CLKID_USB]			= &meson6_usb.hw,
++	[CLKID_EFUSE]			= &meson6_efuse.hw,
++	[CLKID_USB1_DDR_BRIDGE]		= &meson6_usb1_ddr_bridge.hw,
++	[CLKID_USB0_DDR_BRIDGE]		= &meson6_usb0_ddr_bridge.hw,
++	[CLKID_UART2]			= &meson6_uart2.hw,
++	[CLKID_PERIPH]			= &meson6_periph_clk.hw,
++};
++
++static struct clk_regmap *const meson6_clk_regmaps[] = {
++	&meson6_fixed_pll_dco,
++	&meson6_sys_pll_dco,
++	&meson6_sys_pll,
++	&meson6_mpeg_clk_sel,
++	&meson6_mpeg_clk_div,
++	&meson6_clk81,
++	&meson6_cpu_in_sel,
++	&meson6_cpu_scale_out_sel,
++	&meson6_cpu_clk,
++	&meson6_i2c,
++	&meson6_sar_adc,
++	&meson6_rng0,
++	&meson6_uart0,
++	&meson6_sdio,
++	&meson6_eth,
++	&meson6_uart1,
++	&meson6_usb0,
++	&meson6_usb1,
++	&meson6_usb,
++	&meson6_efuse,
++	&meson6_usb1_ddr_bridge,
++	&meson6_usb0_ddr_bridge,
++	&meson6_uart2,
++};
++
++static struct meson_clk_hw_data meson6_clk_hw_data = {
++	.hws = meson6_hw_clks,
++	.num = ARRAY_SIZE(meson6_hw_clks),
++};
++
++static void __init meson6_clkc_init(struct device_node *np)
++{
++	struct device_node *parent_np;
++	struct regmap *map;
++	int i, ret;
++
++	parent_np = of_get_parent(np);
++	map = syscon_node_to_regmap(parent_np);
++	of_node_put(parent_np);
++	if (IS_ERR(map)) {
++		pr_err("%s: failed to get the HHI regmap\n", __func__);
++		return;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(meson6_clk_regmaps); i++)
++		meson6_clk_regmaps[i]->map = map;
++
++	for (i = 0; i < ARRAY_SIZE(meson6_internal_hws); i++) {
++		ret = of_clk_hw_register(np, meson6_internal_hws[i]);
++		if (ret)
++			return;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(meson6_hw_clks); i++) {
++		/* the array is sparse */
++		if (!meson6_hw_clks[i])
++			continue;
++
++		ret = of_clk_hw_register(np, meson6_hw_clks[i]);
++		if (ret)
++			return;
++	}
++
++	ret = clk_notifier_register(meson6_cpu_scale_out_sel.hw.clk,
++				    &meson6_cpu_clk_nb);
++	if (ret) {
++		pr_err("%s: failed to register the CPU clock notifier\n",
++		       __func__);
++		return;
++	}
++
++	ret = of_clk_add_hw_provider(np, meson_clk_hw_get, &meson6_clk_hw_data);
++	if (ret)
++		pr_err("%s: failed to register the clock provider\n", __func__);
++}
++
++CLK_OF_DECLARE_DRIVER(meson6_clkc, "amlogic,meson6-clkc", meson6_clkc_init);
