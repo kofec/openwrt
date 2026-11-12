@@ -1,0 +1,59 @@
+--- a/drivers/regulator/pwm-regulator.c
++++ b/drivers/regulator/pwm-regulator.c
+@@ -321,6 +321,45 @@
+ 	return 0;
+ }
+ 
++/*
++ * The voltage table mode cannot know the output voltage if the boot loader
++ * did not set up the PWM. The regulator core then picks the lowest voltage,
++ * which is not safe for a CPU supply that is still running at full speed.
++ * "regulator-init-microvolt" selects the table entry to start with instead.
++ */
++static int pwm_regulator_init_voltage(struct platform_device *pdev,
++				      struct pwm_regulator_data *drvdata)
++{
++	struct pwm_state pstate;
++	u32 init_uV;
++	int i, ret;
++
++	if (!drvdata->duty_cycle_table ||
++	    of_property_read_u32(pdev->dev.of_node, "regulator-init-microvolt",
++				 &init_uV))
++		return 0;
++
++	for (i = 0; i < drvdata->desc.n_voltages; i++) {
++		if (drvdata->duty_cycle_table[i].uV != init_uV)
++			continue;
++
++		pwm_init_state(drvdata->pwm, &pstate);
++		pwm_set_relative_duty_cycle(&pstate,
++				drvdata->duty_cycle_table[i].dutycycle, 100);
++		pstate.enabled = true;
++
++		ret = pwm_apply_might_sleep(drvdata->pwm, &pstate);
++		if (ret)
++			return ret;
++
++		drvdata->state = i;
++		return 0;
++	}
++
++	return dev_err_probe(&pdev->dev, -EINVAL,
++			     "regulator-init-microvolt is not in the voltage-table\n");
++}
++
+ static int pwm_regulator_init_boot_on(struct platform_device *pdev,
+ 				      struct pwm_regulator_data *drvdata,
+ 				      const struct regulator_init_data *init_data)
+@@ -404,6 +443,10 @@
+ 	if (ret)
+ 		return ret;
+ 
++	ret = pwm_regulator_init_voltage(pdev, drvdata);
++	if (ret)
++		return ret;
++
+ 	ret = pwm_regulator_init_boot_on(pdev, drvdata, init_data);
+ 	if (ret)
+ 		return dev_err_probe(&pdev->dev, ret,
