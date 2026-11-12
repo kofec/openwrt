@@ -1,0 +1,51 @@
+--- a/drivers/phy/amlogic/phy-meson8b-usb2.c
++++ b/drivers/phy/amlogic/phy-meson8b-usb2.c
+@@ -119,6 +119,7 @@
+ 
+ struct phy_meson8b_usb2_match_data {
+ 	bool			host_enable_aca;
++	bool			enable_ref_clk;
+ };
+ 
+ struct phy_meson8b_usb2_priv {
+@@ -169,6 +170,17 @@
+ 	regmap_update_bits(priv->regmap, REG_CONFIG, REG_CONFIG_CLK_32k_ALTSEL,
+ 			   REG_CONFIG_CLK_32k_ALTSEL);
+ 
++	/*
++	 * Meson6: the PHY reference clock is not running after reset. Enable
++	 * it and feed it from the 24MHz crystal without a divider, matching
++	 * the FSEL setting below.
++	 */
++	if (priv->match->enable_ref_clk)
++		regmap_update_bits(priv->regmap, REG_CONFIG,
++				   REG_CONFIG_CLK_EN | REG_CONFIG_CLK_SEL_MASK |
++				   REG_CONFIG_CLK_DIV_MASK,
++				   REG_CONFIG_CLK_EN);
++
+ 	regmap_update_bits(priv->regmap, REG_CTRL, REG_CTRL_REF_CLK_SEL_MASK,
+ 			   0x2 << REG_CTRL_REF_CLK_SEL_SHIFT);
+ 
+@@ -294,6 +306,11 @@
+ 	return PTR_ERR_OR_ZERO(phy_provider);
+ }
+ 
++static const struct phy_meson8b_usb2_match_data phy_meson6_usb2_match_data = {
++	.host_enable_aca = false,
++	.enable_ref_clk = true,
++};
++
+ static const struct phy_meson8b_usb2_match_data phy_meson8_usb2_match_data = {
+ 	.host_enable_aca = false,
+ };
+@@ -304,6 +321,10 @@
+ 
+ static const struct of_device_id phy_meson8b_usb2_of_match[] = {
+ 	{
++		.compatible = "amlogic,meson6-usb2-phy",
++		.data = &phy_meson6_usb2_match_data
++	},
++	{
+ 		.compatible = "amlogic,meson8-usb2-phy",
+ 		.data = &phy_meson8_usb2_match_data
+ 	},
