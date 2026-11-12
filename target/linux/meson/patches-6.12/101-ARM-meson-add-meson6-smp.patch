@@ -1,0 +1,77 @@
+--- a/arch/arm/mach-meson/platsmp.c
++++ b/arch/arm/mach-meson/platsmp.c
+@@ -410,6 +410,69 @@
+ }
+ #endif
+ 
++/*
++ * Meson6: the boot ROM parks the secondary core and waits for the start
++ * address and the per-CPU enable bit in the SMP SRAM. No power sequencing
++ * through the PMU is needed.
++ */
++static void __init meson6_smp_prepare_cpus(unsigned int max_cpus)
++{
++	struct device_node *node;
++
++	node = of_find_compatible_node(NULL, NULL, "amlogic,meson6-smp-sram");
++	if (!node) {
++		pr_err("Missing SRAM node\n");
++		return;
++	}
++
++	sram_base = of_iomap(node, 0);
++	of_node_put(node);
++	if (!sram_base) {
++		pr_err("Couldn't map SRAM registers\n");
++		return;
++	}
++
++	node = of_find_compatible_node(NULL, NULL, "arm,cortex-a9-scu");
++	if (!node) {
++		pr_err("Missing SCU node\n");
++		return;
++	}
++
++	scu_base = of_iomap(node, 0);
++	of_node_put(node);
++	if (!scu_base) {
++		pr_err("Couldn't map SCU registers\n");
++		return;
++	}
++
++	scu_enable(scu_base);
++}
++
++static int meson6_smp_boot_secondary(unsigned int cpu,
++				     struct task_struct *idle)
++{
++	if (!sram_base || !scu_base)
++		return -ENODEV;
++
++	writel(__pa_symbol(secondary_startup),
++	       sram_base + MESON_SMP_SRAM_CPU_CTRL_ADDR_REG(cpu));
++
++	scu_cpu_power_enable(scu_base, cpu);
++
++	meson_smp_set_cpu_ctrl(cpu, true);
++
++	/* wake the core from the WFE/WFI loop of the boot ROM */
++	dsb_sev();
++	arch_send_wakeup_ipi_mask(cpumask_of(cpu));
++
++	return 0;
++}
++
++static struct smp_operations meson6_smp_ops __initdata = {
++	.smp_prepare_cpus	= meson6_smp_prepare_cpus,
++	.smp_boot_secondary	= meson6_smp_boot_secondary,
++};
++
+ static struct smp_operations meson8_smp_ops __initdata = {
+ 	.smp_prepare_cpus	= meson8_smp_prepare_cpus,
+ 	.smp_boot_secondary	= meson8_smp_boot_secondary,
+@@ -430,3 +493,4 @@
+ 
+ CPU_METHOD_OF_DECLARE(meson8_smp, "amlogic,meson8-smp", &meson8_smp_ops);
+ CPU_METHOD_OF_DECLARE(meson8b_smp, "amlogic,meson8b-smp", &meson8b_smp_ops);
++CPU_METHOD_OF_DECLARE(meson6_smp, "amlogic,meson6-smp", &meson6_smp_ops);
