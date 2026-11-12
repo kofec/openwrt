@@ -1,0 +1,111 @@
+--- a/drivers/iio/adc/meson_saradc.c
++++ b/drivers/iio/adc/meson_saradc.c
+@@ -319,6 +319,8 @@
+ 	unsigned int				resolution;
+ 	const struct regmap_config		*regmap_config;
+ 	u8					temperature_trimming_bits;
++	bool					temp_sen_sel_in_reg0;
++	u16					temperature_fixed_adc_val;
+ 	unsigned int				temperature_multiplier;
+ 	unsigned int				temperature_divider;
+ 	u8					disable_ring_counter;
+@@ -519,7 +521,18 @@
+ 			   MESON_SAR_ADC_DETECT_IDLE_SW_IDLE_MUX_SEL_MASK,
+ 			   regval);
+ 
+-	if (chan->address == MESON_SAR_ADC_VOLTAGE_AND_TEMP_CHANNEL) {
++	if (chan->address == MESON_SAR_ADC_VOLTAGE_AND_TEMP_CHANNEL &&
++	    priv->param->temp_sen_sel_in_reg0) {
++		/* Meson6 selects the temperature sensor in REG0 */
++		if (chan->type == IIO_TEMP)
++			regval = MESON_SAR_ADC_REG0_ADC_TEMP_SEN_SEL;
++		else
++			regval = 0;
++
++		regmap_update_bits(priv->regmap, MESON_SAR_ADC_REG0,
++				   MESON_SAR_ADC_REG0_ADC_TEMP_SEN_SEL,
++				   regval);
++	} else if (chan->address == MESON_SAR_ADC_VOLTAGE_AND_TEMP_CHANNEL) {
+ 		if (chan->type == IIO_TEMP)
+ 			regval = MESON_SAR_ADC_DELTA_10_TEMP_SEL;
+ 		else
+@@ -861,8 +874,8 @@
+ 	meson_sar_adc_stop_sample_engine(indio_dev);
+ 
+ 	/*
+-	 * disable this bit as seems to be only relevant for Meson6 (based
+-	 * on the vendor driver), which we don't support at the moment.
++	 * This bit is only relevant for Meson6 (based on the vendor driver)
++	 * where it is set while the temperature channel is sampled.
+ 	 */
+ 	regmap_clear_bits(priv->regmap, MESON_SAR_ADC_REG0,
+ 			  MESON_SAR_ADC_REG0_ADC_TEMP_SEN_SEL);
+@@ -933,7 +946,9 @@
+ 	regval |= MESON_SAR_ADC_AUX_SW_XP_DRIVE_SW;
+ 	regmap_write(priv->regmap, MESON_SAR_ADC_AUX_SW, regval);
+ 
+-	if (priv->temperature_sensor_calibrated) {
++	if (priv->param->temp_sen_sel_in_reg0) {
++		/* Meson6: no trimming, nothing to set up in DELTA_10 */
++	} else if (priv->temperature_sensor_calibrated) {
+ 		regmap_set_bits(priv->regmap, MESON_SAR_ADC_DELTA_10,
+ 				MESON_SAR_ADC_DELTA_10_TS_REVE1);
+ 		regmap_set_bits(priv->regmap, MESON_SAR_ADC_DELTA_10,
+@@ -1183,6 +1198,23 @@
+ 	.read_label = read_label,
+ };
+ 
++/*
++ * The vendor kernel converts the raw value of the temperature channel with
++ * "raw * 28897 / 100000 - 100" (degrees Celsius), there is no trimming.
++ * 27 * divider / multiplier - 439 results in the offset of -346 raw steps.
++ */
++static const struct meson_sar_adc_param meson_sar_adc_meson6_param = {
++	.has_bl30_integration = false,
++	.clock_rate = 1150000,
++	.bandgap_reg = MESON_SAR_ADC_DELTA_10,
++	.regmap_config = &meson_sar_adc_regmap_config_meson8,
++	.resolution = 10,
++	.temp_sen_sel_in_reg0 = true,
++	.temperature_fixed_adc_val = 439,
++	.temperature_multiplier = 28897,
++	.temperature_divider = 100000,
++};
++
+ static const struct meson_sar_adc_param meson_sar_adc_meson8_param = {
+ 	.has_bl30_integration = false,
+ 	.clock_rate = 1150000,
+@@ -1255,6 +1287,11 @@
+ 	.vref_select = VREF_VDDA,
+ };
+ 
++static const struct meson_sar_adc_data meson_sar_adc_meson6_data = {
++	.param = &meson_sar_adc_meson6_param,
++	.name = "meson-meson6-saradc",
++};
++
+ static const struct meson_sar_adc_data meson_sar_adc_meson8_data = {
+ 	.param = &meson_sar_adc_meson8_param,
+ 	.name = "meson-meson8-saradc",
+@@ -1297,6 +1334,9 @@
+ 
+ static const struct of_device_id meson_sar_adc_of_match[] = {
+ 	{
++		.compatible = "amlogic,meson6-saradc",
++		.data = &meson_sar_adc_meson6_data,
++	}, {
+ 		.compatible = "amlogic,meson8-saradc",
+ 		.data = &meson_sar_adc_meson8_data,
+ 	}, {
+@@ -1400,6 +1440,11 @@
+ 		ret = meson_sar_adc_temp_sensor_init(indio_dev);
+ 		if (ret)
+ 			return ret;
++	} else if (priv->param->temperature_fixed_adc_val) {
++		/* no calibration data in the eFuse, fixed conversion */
++		priv->temperature_sensor_calibrated = true;
++		priv->temperature_sensor_adc_val =
++			priv->param->temperature_fixed_adc_val;
+ 	}
+ 
+ 	if (priv->temperature_sensor_calibrated) {
