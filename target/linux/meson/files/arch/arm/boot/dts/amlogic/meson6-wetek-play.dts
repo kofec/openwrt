@@ -143,9 +143,13 @@
 	};
 
 	/*
-	 * Tylko dzielniki /3, /2, /1 za PLL-em systemowym ustawionym przez
-	 * U-Boota na 1200 MHz; samego PLL-a nie ruszamy. Napięcia rdzenia wg
-	 * tabeli dvfs vendora (do 792 MHz: 1,01 V, 1200 MHz: 1,24 V).
+	 * Częstotliwości i napięcia jak w tabeli dvfs vendora (vendor bierze
+	 * napięcie z pierwszego wpisu >= częstotliwości). 400 i 600 MHz to
+	 * dzielniki /3 i /2 za PLL-em na 1200 MHz, wyższe stopnie przestawiają
+	 * sam PLL (N = 1, M = 32..63, łatka 103). 1416 i 1512 MHz tylko po
+	 * włączeniu /sys/devices/system/cpu/cpufreq/boost: vendor 3.10 ogranicza
+	 * PLL po cichu do 1320 MHz, więc to trzeba najpierw sprawdzić pod
+	 * obciążeniem.
 	 */
 	cpu_opp_table: opp-table {
 		compatible = "operating-points-v2";
@@ -161,9 +165,36 @@
 			opp-microvolt = <1010000>;
 		};
 
+		opp-792000000 {
+			opp-hz = /bits/ 64 <792000000>;
+			opp-microvolt = <1010000>;
+		};
+
+		opp-984000000 {
+			opp-hz = /bits/ 64 <984000000>;
+			opp-microvolt = <1110000>;
+		};
+
 		opp-1200000000 {
 			opp-hz = /bits/ 64 <1200000000>;
 			opp-microvolt = <1240000>;
+		};
+
+		opp-1320000000 {
+			opp-hz = /bits/ 64 <1320000000>;
+			opp-microvolt = <1320000>;
+		};
+
+		opp-1416000000 {
+			opp-hz = /bits/ 64 <1416000000>;
+			opp-microvolt = <1320000>;
+			turbo-mode;
+		};
+
+		opp-1512000000 {
+			opp-hz = /bits/ 64 <1512000000>;
+			opp-microvolt = <1320000>;
+			turbo-mode;
 		};
 	};
 

@@ -32,17 +32,17 @@
  obj-$(CONFIG_COMMON_CLK_S4_PERIPHERALS) += s4-peripherals.o
 --- /dev/null
 +++ b/drivers/clk/meson/meson6.c
-@@ -0,0 +1,531 @@
+@@ -0,0 +1,621 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Amlogic Meson6 (AML8726-MX) clock controller
 + *
 + * The register layout of the peripheral clock (clk81), the CPU clock mux and
 + * the gates is the same as on Meson8b. The PLLs live at different offsets.
-+ * This driver describes the tree as it is left by the boot loader: the PLLs
-+ * are read-only. The CPU clock can be switched between the outputs of the
-+ * post dividers of the system PLL (/1, /2, /3) and the peripheral gates are
-+ * controlled.
++ * The fixed PLL is described as it is left by the boot loader (read-only).
++ * The system PLL feeds only the CPU and is reprogrammed like in the vendor
++ * kernel; the CPU clock is switched between the outputs of its post dividers
++ * (/1, /2, /3) and the peripheral gates are controlled.
 + *
 + * The clock IDs of the Meson8b binding are reused.
 + */
@@ -67,6 +67,9 @@
 +#define HHI_MPEG_CLK_CNTL		0x174
 +#define HHI_SYS_CPU_CLK_CNTL		0x19c
 +#define HHI_SYS_PLL_CNTL		0x260
++#define HHI_SYS_PLL_CNTL2		0x264
++#define HHI_SYS_PLL_CNTL3		0x268
++#define HHI_SYS_PLL_CNTL4		0x26c
 +#define HHI_MPLL_CNTL			0x280
 +#define HHI_GEN_CLK_CNTL2		0x22c
 +
@@ -206,6 +209,87 @@
 +	},
 +};
 +
++/*
++ * The vendor kernel (arch/arm/mach-meson6/clock.c, sys_pll_settings) runs the
++ * system PLL with N = 1 and M = 32..63, i.e. 768..1512 MHz in 24 MHz steps,
++ * with the output divider at 1. Lower CPU rates come from the post dividers.
++ * While the PLL relocks the CPU is parked on the crystal by the notifier
++ * on cpu_scale_out_sel below.
++ */
++#define MESON6_SYS_PLL_M_MIN		32
++#define MESON6_SYS_PLL_M_MAX		63
++
++/* analog settings, vendor: M6_PLL_CNTL_CST2..4 */
++static const struct reg_sequence meson6_sys_pll_init_regs[] = {
++	{ .reg = HHI_SYS_PLL_CNTL2,	.def = 0x814d3928 },
++	{ .reg = HHI_SYS_PLL_CNTL3,	.def = 0x6b425012 },
++	{ .reg = HHI_SYS_PLL_CNTL4,	.def = 0x00000110 },
++};
++
++static unsigned long meson6_sys_pll_recalc_rate(struct clk_hw *hw,
++						unsigned long parent_rate)
++{
++	return meson_clk_pll_ro_ops.recalc_rate(hw, parent_rate);
++}
++
++static int meson6_sys_pll_determine_rate(struct clk_hw *hw,
++					 struct clk_rate_request *req)
++{
++	unsigned long m;
++
++	if (!req->best_parent_rate)
++		return -EINVAL;
++
++	m = clamp_t(unsigned long, req->rate / req->best_parent_rate,
++		    MESON6_SYS_PLL_M_MIN, MESON6_SYS_PLL_M_MAX);
++	req->rate = req->best_parent_rate * m;
++
++	return 0;
++}
++
++static int meson6_sys_pll_set_rate(struct clk_hw *hw, unsigned long rate,
++				   unsigned long parent_rate)
++{
++	struct clk_regmap *clk = to_clk_regmap(hw);
++	struct meson_clk_pll_data *pll = clk->data;
++	unsigned long m;
++	int delay = 5000;
++
++	if (!parent_rate)
++		return -EINVAL;
++
++	m = rate / parent_rate;
++	if (m < MESON6_SYS_PLL_M_MIN || m > MESON6_SYS_PLL_M_MAX ||
++	    m * parent_rate != rate)
++		return -EINVAL;
++
++	/* vendor: set_sys_pll() */
++	meson_parm_write(clk->map, &pll->rst, 1);
++	meson_parm_write(clk->map, &pll->n, 1);
++	meson_parm_write(clk->map, &pll->m, m);
++	regmap_multi_reg_write(clk->map, meson6_sys_pll_init_regs,
++			       ARRAY_SIZE(meson6_sys_pll_init_regs));
++	meson_parm_write(clk->map, &pll->rst, 0);
++
++	/* the lock bit is only valid after 100us */
++	udelay(100);
++	do {
++		if (meson_parm_read(clk->map, &pll->l))
++			return 0;
++		udelay(20);
++	} while (--delay);
++
++	pr_err("%s: the system PLL did not lock at %lu Hz\n", __func__, rate);
++
++	return -ETIMEDOUT;
++}
++
++static const struct clk_ops meson6_sys_pll_ops = {
++	.recalc_rate	= meson6_sys_pll_recalc_rate,
++	.determine_rate	= meson6_sys_pll_determine_rate,
++	.set_rate	= meson6_sys_pll_set_rate,
++};
++
 +static struct clk_regmap meson6_sys_pll_dco = {
 +	.data = &(struct meson_clk_pll_data){
 +		.en = {
@@ -236,7 +320,7 @@
 +	},
 +	.hw.init = &(struct clk_init_data){
 +		.name = "sys_pll_dco",
-+		.ops = &meson_clk_pll_ro_ops,
++		.ops = &meson6_sys_pll_ops,
 +		.parent_data = &meson6_xtal,
 +		.num_parents = 1,
 +	},
@@ -247,7 +331,8 @@
 +		.offset = HHI_SYS_PLL_CNTL,
 +		.shift = 16,
 +		.width = 2,
-+		.flags = CLK_DIVIDER_POWER_OF_TWO,
++		/* stays at 1 as set by the boot loader */
++		.flags = CLK_DIVIDER_POWER_OF_TWO | CLK_DIVIDER_READ_ONLY,
 +	},
 +	.hw.init = &(struct clk_init_data){
 +		.name = "sys_pll",
@@ -256,6 +341,7 @@
 +			&meson6_sys_pll_dco.hw
 +		},
 +		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
 +	},
 +};
 +
@@ -277,6 +363,7 @@
 +			{ .hw = &meson6_sys_pll.hw, },
 +		},
 +		.num_parents = 2,
++		.flags = CLK_SET_RATE_PARENT,
 +	},
 +};
 +
@@ -290,6 +377,7 @@
 +			&meson6_cpu_in_sel.hw
 +		},
 +		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
 +	},
 +};
 +
@@ -303,6 +391,7 @@
 +			&meson6_cpu_in_sel.hw
 +		},
 +		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
 +	},
 +};
 +
@@ -319,8 +408,8 @@
 +	.hw.init = &(struct clk_init_data){
 +		.name = "cpu_scale_out_sel",
 +		/*
-+		 * No CLK_SET_RATE_PARENT: the rate is changed by selecting
-+		 * another post divider, the system PLL itself is not touched.
++		 * The rate is set by choosing a post divider and, through
++		 * CLK_SET_RATE_PARENT, the system PLL rate behind it.
 +		 */
 +		.ops = &clk_regmap_mux_ops,
 +		.parent_hws = (const struct clk_hw *[]) {
@@ -329,6 +418,7 @@
 +			&meson6_cpu_in_div3.hw,
 +		},
 +		.num_parents = 3,
++		.flags = CLK_SET_RATE_PARENT,
 +	},
 +};
 +
@@ -368,7 +458,7 @@
 +
 +/*
 + * Like on Meson8b the CPU is parked on the crystal while the post divider
-+ * mux is changed, the vendor kernel does the same.
++ * mux or the system PLL behind it is changed, the vendor kernel does the same.
 + */
 +static int meson6_cpu_clk_notifier_cb(struct notifier_block *nb,
 +				      unsigned long event, void *data)
