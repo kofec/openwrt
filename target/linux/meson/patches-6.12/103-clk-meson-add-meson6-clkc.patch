@@ -32,7 +32,7 @@
  obj-$(CONFIG_COMMON_CLK_S4_PERIPHERALS) += s4-peripherals.o
 --- /dev/null
 +++ b/drivers/clk/meson/meson6.c
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,531 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Amlogic Meson6 (AML8726-MX) clock controller
@@ -68,6 +68,10 @@
 +#define HHI_SYS_CPU_CLK_CNTL		0x19c
 +#define HHI_SYS_PLL_CNTL		0x260
 +#define HHI_MPLL_CNTL			0x280
++#define HHI_GEN_CLK_CNTL2		0x22c
++
++/* not part of the Meson8b binding: clock output 3 (32kHz for Wi-Fi modules) */
++#define MESON6_CLKID_CLK_OUT3		250
 +
 +static const struct clk_parent_data meson6_xtal = {
 +	.fw_name = "xtal",
@@ -419,6 +423,24 @@
 +static MESON6_GATE(meson6_usb0_ddr_bridge, HHI_GCLK_MPEG2, 9);
 +static MESON6_GATE(meson6_uart2, HHI_GCLK_MPEG2, 15);
 +
++/*
++ * CLK_OUT3 on GPIOX_12. The vendor kernel selects the source with bit 22,
++ * sets the divider (bits 18:13) to 0 and enables the output with bit 21 to
++ * get the 32kHz low power clock of the Wi-Fi module. The source is not
++ * described, so the rate is unknown to the clock framework.
++ */
++static struct clk_regmap meson6_clk_out3 = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_GEN_CLK_CNTL2,
++		.bit_idx = 21,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "clk_out3",
++		.ops = &clk_regmap_gate_ops,
++		.num_parents = 0,
++	},
++};
++
 +/* clocks which are not exposed through the DT binding, parents first */
 +static struct clk_hw *meson6_internal_hws[] = {
 +	&meson6_fixed_pll_dco.hw,
@@ -456,6 +478,7 @@
 +	[CLKID_USB0_DDR_BRIDGE]		= &meson6_usb0_ddr_bridge.hw,
 +	[CLKID_UART2]			= &meson6_uart2.hw,
 +	[CLKID_PERIPH]			= &meson6_periph_clk.hw,
++	[MESON6_CLKID_CLK_OUT3]		= &meson6_clk_out3.hw,
 +};
 +
 +static struct clk_regmap *const meson6_clk_regmaps[] = {
@@ -482,6 +505,7 @@
 +	&meson6_usb1_ddr_bridge,
 +	&meson6_usb0_ddr_bridge,
 +	&meson6_uart2,
++	&meson6_clk_out3,
 +};
 +
 +static struct meson_clk_hw_data meson6_clk_hw_data = {
@@ -505,6 +529,10 @@
 +
 +	for (i = 0; i < ARRAY_SIZE(meson6_clk_regmaps); i++)
 +		meson6_clk_regmaps[i]->map = map;
++
++	/* source and divider of CLK_OUT3 as set up by the vendor kernel */
++	regmap_update_bits(map, HHI_GEN_CLK_CNTL2, BIT(22) | GENMASK(18, 13),
++			   BIT(22));
 +
 +	for (i = 0; i < ARRAY_SIZE(meson6_internal_hws); i++) {
 +		ret = of_clk_hw_register(np, meson6_internal_hws[i]);

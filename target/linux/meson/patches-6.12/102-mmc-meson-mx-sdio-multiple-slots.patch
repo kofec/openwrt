@@ -40,7 +40,7 @@
  
  	void __iomem			*base;
  	int				irq;
-@@ -114,18 +134,21 @@
+@@ -114,18 +134,23 @@
  
  	struct timer_list		cmd_timeout;
  
@@ -57,6 +57,8 @@
  	struct mmc_request		*mrq;
  	struct mmc_command		*cmd;
 -	int				error;
++	/* the interrupt of cmd was seen, protected by irq_lock */
++	bool				cmd_irq_seen;
  };
  
 -static void meson_mx_mmc_mask_bits(struct mmc_host *mmc, char reg, u32 mask,
@@ -68,7 +70,7 @@
  	u32 regval;
  
  	regval = readl(host->base + reg);
-@@ -152,10 +175,10 @@
+@@ -152,10 +177,10 @@
  		return NULL;
  }
  
@@ -81,7 +83,7 @@
  	unsigned int pack_size;
  	unsigned long irqflags, timeout;
  	u32 mult, send = 0, ext = 0;
-@@ -194,7 +217,7 @@
+@@ -194,7 +219,7 @@
  				   (cmd->data->blocks - 1));
  
  		pack_size = cmd->data->blksz * BITS_PER_BYTE;
@@ -90,8 +92,12 @@
  			pack_size += MESON_MX_SDIO_RESPONSE_CRC16_BITS * 4;
  		else
  			pack_size += MESON_MX_SDIO_RESPONSE_CRC16_BITS * 1;
-@@ -217,17 +240,17 @@
+@@ -215,19 +240,21 @@
  
+ 	spin_lock_irqsave(&host->irq_lock, irqflags);
+ 
++	host->cmd_irq_seen = false;
++
  	mult = readl(host->base + MESON_MX_SDIO_MULT);
  	mult &= ~MESON_MX_SDIO_MULT_PORT_SEL_MASK;
 -	mult |= FIELD_PREP(MESON_MX_SDIO_MULT_PORT_SEL_MASK, host->slot_id);
@@ -111,7 +117,7 @@
  			       MESON_MX_SDIO_IRQS_CMD_INT,
  			       MESON_MX_SDIO_IRQS_CMD_INT);
  
-@@ -240,56 +263,108 @@
+@@ -240,56 +267,108 @@
  	mod_timer(&host->cmd_timeout, jiffies + timeout);
  }
  
@@ -240,7 +246,7 @@
  
  	switch (ios->power_mode) {
  	case MMC_POWER_OFF:
-@@ -297,10 +372,10 @@
+@@ -297,10 +376,10 @@
  		fallthrough;
  	case MMC_POWER_UP:
  		if (!IS_ERR(mmc->supply.vmmc)) {
@@ -253,7 +259,7 @@
  				return;
  		}
  		break;
-@@ -336,34 +411,43 @@
+@@ -336,34 +415,43 @@
  
  static void meson_mx_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
  {
@@ -311,16 +317,31 @@
  	u32 mult;
  	int i, resp[4];
  
-@@ -399,7 +483,7 @@
+@@ -398,8 +486,11 @@
+ 	if (!cmd)
  		return IRQ_HANDLED;
  
++	/* from now on the timeout handler must not finish this command */
++	host->cmd_irq_seen = true;
++
  	cmd->error = 0;
 -	meson_mx_mmc_read_response(host->mmc, cmd);
 +	meson_mx_mmc_read_response(host, cmd);
  
  	if (cmd->data) {
  		if (!((irqs & MESON_MX_SDIO_IRQS_DATA_READ_CRC16_OK) ||
-@@ -449,7 +533,7 @@
+@@ -443,13 +534,17 @@
+ 	struct meson_mx_mmc_host *host = (void *) irq_data;
+ 	struct mmc_command *cmd = host->cmd, *next_cmd;
+ 
+-	if (WARN_ON(!cmd))
++	/*
++	 * The timeout handler leaves a command alone once its interrupt was
++	 * seen, so there has to be a command here.
++	 */
++	if (WARN_ON_ONCE(!cmd))
+ 		return IRQ_HANDLED;
+ 
  	del_timer_sync(&host->cmd_timeout);
  
  	if (cmd->data) {
@@ -329,7 +350,7 @@
  				cmd->data->sg_len,
  				mmc_get_dma_dir(cmd->data));
  
-@@ -458,7 +542,7 @@
+@@ -458,7 +553,7 @@
  
  	next_cmd = meson_mx_mmc_get_next_cmd(cmd);
  	if (next_cmd)
@@ -338,16 +359,63 @@
  	else
  		meson_mx_mmc_request_done(host);
  
-@@ -487,7 +571,7 @@
- 	if (!host->cmd)
- 		return;
+@@ -468,11 +563,23 @@
+ static void meson_mx_mmc_timeout(struct timer_list *t)
+ {
+ 	struct meson_mx_mmc_host *host = from_timer(host, t, cmd_timeout);
++	struct mmc_host *mmc;
+ 	unsigned long irqflags;
+ 	u32 irqc;
+ 
+ 	spin_lock_irqsave(&host->irq_lock, irqflags);
+ 
++	/*
++	 * skip the timeout handling if the command is gone or if the interrupt
++	 * handler already saw its interrupt: the threaded handler is about to
++	 * finish it. Checking this under irq_lock closes the race between
++	 * this timer and the interrupt.
++	 */
++	if (!host->cmd || host->cmd_irq_seen) {
++		spin_unlock_irqrestore(&host->irq_lock, irqflags);
++		return;
++	}
++
+ 	/* disable the CMD interrupt */
+ 	irqc = readl(host->base + MESON_MX_SDIO_IRQC);
+ 	irqc &= ~MESON_MX_SDIO_IRQC_ARC_CMD_INT_EN;
+@@ -480,17 +587,21 @@
+ 
+ 	spin_unlock_irqrestore(&host->irq_lock, irqflags);
+ 
+-	/*
+-	 * skip the timeout handling if the interrupt handler already processed
+-	 * the command.
+-	 */
+-	if (!host->cmd)
+-		return;
++	mmc = host->cur_slot->mmc;
  
 -	dev_dbg(mmc_dev(host->mmc),
-+	dev_dbg(mmc_dev(host->cur_slot->mmc),
- 		"Timeout on CMD%u (IRQS = 0x%08x, ARGU = 0x%08x)\n",
- 		host->cmd->opcode, readl(host->base + MESON_MX_SDIO_IRQS),
- 		readl(host->base + MESON_MX_SDIO_ARGU));
-@@ -504,49 +588,62 @@
+-		"Timeout on CMD%u (IRQS = 0x%08x, ARGU = 0x%08x)\n",
+-		host->cmd->opcode, readl(host->base + MESON_MX_SDIO_IRQS),
+-		readl(host->base + MESON_MX_SDIO_ARGU));
++	/* timeouts are expected while probing for a card, not afterwards */
++	if (mmc->card)
++		dev_warn_ratelimited(mmc_dev(mmc),
++				     "Timeout on CMD%u (IRQS = 0x%08x, ARGU = 0x%08x)\n",
++				     host->cmd->opcode,
++				     readl(host->base + MESON_MX_SDIO_IRQS),
++				     readl(host->base + MESON_MX_SDIO_ARGU));
++	else
++		dev_dbg(mmc_dev(mmc),
++			"Timeout on CMD%u (IRQS = 0x%08x, ARGU = 0x%08x)\n",
++			host->cmd->opcode,
++			readl(host->base + MESON_MX_SDIO_IRQS),
++			readl(host->base + MESON_MX_SDIO_ARGU));
+ 
+ 	host->cmd->error = -ETIMEDOUT;
+ 
+@@ -504,49 +615,62 @@
  	.get_ro			= mmc_gpio_get_ro,
  };
  
@@ -436,7 +504,7 @@
  
  	mmc->max_req_size = MESON_MX_SDIO_BOUNCE_REQ_SIZE;
  	mmc->max_seg_size = mmc->max_req_size;
-@@ -559,150 +656,108 @@
+@@ -559,150 +683,108 @@
  	mmc->max_blk_size /= BITS_PER_BYTE;
  
  	/* Get the min and max supported clock rates */
@@ -480,15 +548,15 @@
  {
 -	struct clk_init_data init;
 -	const char *clk_div_parent, *clk_fixed_factor_parent;
-+	int i;
- 
+-
 -	clk_fixed_factor_parent = __clk_get_name(host->parent_clk);
 -	init.name = devm_kasprintf(host->controller_dev, GFP_KERNEL,
 -				   "%s#fixed_factor",
 -				   dev_name(host->controller_dev));
 -	if (!init.name)
 -		return -ENOMEM;
--
++	int i;
+ 
 -	init.ops = &clk_fixed_factor_ops;
 -	init.flags = 0;
 -	init.parent_names = &clk_fixed_factor_parent;
@@ -632,7 +700,7 @@
  	conf |= FIELD_PREP(MESON_MX_SDIO_CONF_CMD_ARGUMENT_BITS_MASK, 39);
  	conf |= FIELD_PREP(MESON_MX_SDIO_CONF_M_ENDIAN_MASK, 0x3);
  	conf |= FIELD_PREP(MESON_MX_SDIO_CONF_WRITE_NWR_MASK, 0x2);
-@@ -711,41 +766,48 @@
+@@ -711,41 +793,48 @@
  
  	meson_mx_mmc_soft_reset(host);
  

@@ -154,6 +154,9 @@
 		compatible = "mmc-pwrseq-simple";
 		reset-gpios = <&gpio_c 7 GPIO_ACTIVE_LOW>;
 		post-power-on-delay-ms = <200>;
+		/* 32 kHz LPO modułu z CLK_OUT3 (GPIOX_12), id spoza bindingu */
+		clocks = <&clkc 250>;
+		clock-names = "ext_clock";
 	};
 
 	vcc_wifi: regulator-vcc-wifi {
