@@ -30,8 +30,8 @@ docker build -t openwrt:alpine -f Containerfile-alpine .
 ## Build
 
 ```sh
-git clone https://github.com/kofec/openwrt_1907.git
-cd openwrt_1907
+git clone -b openwrt-19.07 https://github.com/kofec/openwrt.git openwrt-19.07
+cd openwrt-19.07
 ./scripts/feeds update -a
 ./scripts/feeds install -a
 
