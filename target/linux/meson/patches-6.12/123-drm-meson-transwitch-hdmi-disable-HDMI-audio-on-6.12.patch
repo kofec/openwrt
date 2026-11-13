@@ -1,0 +1,56 @@
+From d9c9e76dfdfc071175430114d7831f426ce55fae Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Fri, 13 Nov 2026 17:55:27 +0000
+Subject: [PATCH] drm/meson: transwitch-hdmi: disable HDMI audio on 6.12 (needs
+ v6.14 bridge audio helpers)
+
+---
+ drivers/gpu/drm/meson/meson_transwitch_hdmi.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c
+index ab2f2e83a..1a0a65dad 100644
+--- a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c
++++ b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c
+@@ -878,6 +878,7 @@ static int meson_txc_hdmi_write_infoframe(struct drm_bridge *bridge,
+ 	return 0;
+ }
+ 
++#ifdef MESON_TXC_HDMI_AUDIO /* needs the HDMI audio bridge helpers from v6.14 */
+ static u32 meson_txc_hdmi_hdmi_codec_calc_audio_n(struct hdmi_codec_params *hparms)
+ {
+ 	u32 audio_n;
+@@ -1091,6 +1092,7 @@ static void meson_txc_hdmi_audio_shutdown(struct drm_connector *connector,
+ 	regmap_set_bits(priv->regmap, TX_PACKET_CONTROL_2,
+ 			TX_PACKET_CONTROL_2_AUDIO_REQUEST_DISABLE);
+ }
++#endif
+ 
+ static const struct drm_bridge_funcs meson_txc_hdmi_bridge_funcs = {
+ 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
+@@ -1107,10 +1109,12 @@ static const struct drm_bridge_funcs meson_txc_hdmi_bridge_funcs = {
+ 	.hdmi_tmds_char_rate_valid = meson_txc_hdmi_tmds_char_rate_valid,
+ 	.hdmi_write_infoframe = meson_txc_hdmi_write_infoframe,
+ 	.hdmi_clear_infoframe = meson_txc_hdmi_clear_infoframe,
++#ifdef MESON_TXC_HDMI_AUDIO /* needs the HDMI audio bridge helpers from v6.14 */
+ 	.hdmi_audio_prepare = meson_txc_hdmi_audio_prepare,
+ 	.hdmi_audio_mute_stream = meson_txc_hdmi_audio_mute_stream,
+ 	.hdmi_audio_startup = meson_txc_hdmi_audio_startup,
+ 	.hdmi_audio_shutdown = meson_txc_hdmi_audio_shutdown,
++#endif
+ };
+ 
+ static int meson_txc_hdmi_hw_init(struct meson_txc_hdmi *priv,
+@@ -1306,10 +1310,12 @@ static int meson_txc_hdmi_probe(struct platform_device *pdev)
+ 					 BIT(HDMI_COLORSPACE_YUV444);
+ 	priv->bridge.vendor = "Amlogic";
+ 	priv->bridge.product = "TranSwitch-HDMI";
++#ifdef MESON_TXC_HDMI_AUDIO /* needs the HDMI audio bridge helpers from v6.14 */
+ 	priv->bridge.hdmi_audio_dev = dev;
+ 	priv->bridge.hdmi_audio_max_i2s_playback_channels = 8;
+ 	priv->bridge.hdmi_audio_spdif_playback = 1;
+ 	priv->bridge.hdmi_audio_dai_port = 2;
++#endif
+ 
+ 	drm_bridge_add(&priv->bridge);
+ 

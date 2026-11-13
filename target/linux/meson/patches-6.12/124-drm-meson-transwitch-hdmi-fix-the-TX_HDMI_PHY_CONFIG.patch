@@ -1,0 +1,25 @@
+From 1d60c1b880414e2131147f8750937ecb00ea523e Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Fri, 13 Nov 2026 18:03:03 +0000
+Subject: [PATCH] drm/meson: transwitch-hdmi: fix the TX_HDMI_PHY_CONFIG1
+ register offset
+
+It is 0x11, not 0x10 (same as TX_HDMI_PHY_CONFIG0), according to the
+vendor hdmi_tx_reg.h for Meson6 and Meson8.
+---
+ drivers/gpu/drm/meson/meson_transwitch_hdmi.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_transwitch_hdmi.h b/drivers/gpu/drm/meson/meson_transwitch_hdmi.h
+index a1dd7c0a9..ca8a3aa9f 100644
+--- a/drivers/gpu/drm/meson/meson_transwitch_hdmi.h
++++ b/drivers/gpu/drm/meson/meson_transwitch_hdmi.h
+@@ -43,7 +43,7 @@
+ // system config 1
+ #define TX_HDMI_PHY_CONFIG0						0x0010
+ 	#define TX_HDMI_PHY_CONFIG0_HDMI_COMMON_B7_B0		GENMASK(7, 0)
+-#define TX_HDMI_PHY_CONFIG1						0x0010
++#define TX_HDMI_PHY_CONFIG1						0x0011
+ 	#define TX_HDMI_PHY_CONFIG1_HDMI_COMMON_B11_B8		GENMASK(3, 0)
+ 	#define TX_HDMI_PHY_CONFIG1_HDMI_CTL_REG_B3_B0		GENMASK(7, 4)
+ #define TX_HDMI_PHY_CONFIG2						0x0012
