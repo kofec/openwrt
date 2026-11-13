@@ -19,6 +19,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/leds/common.h>
 #include <dt-bindings/reset/amlogic,meson8b-reset.h>
+#include <dt-bindings/reset/amlogic,meson8b-clkc-reset.h>
 #include <dt-bindings/thermal/thermal.h>
 #include "meson6.dtsi"
 
@@ -279,6 +280,30 @@
 		clock-names = "ext_clock";
 	};
 
+	/* vendor: pwr_5v_on = "cpu","GPIOD_5","H" (GPIOD_5 = PREG_PAD_GPIO2 bit 21) */
+	hdmi_5v: regulator-hdmi-5v {
+		compatible = "regulator-fixed";
+		regulator-name = "HDMI_5V";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		gpio = <&gpio_c 21 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-always-on;
+		pinctrl-0 = <&hdmi_5v_pins>;
+		pinctrl-names = "default";
+	};
+
+	hdmi-connector {
+		compatible = "hdmi-connector";
+		type = "a";
+
+		port {
+			hdmi_connector_in: endpoint {
+				remote-endpoint = <&hdmi_tx_tmds_out>;
+			};
+		};
+	};
+
 	vcc_wifi: regulator-vcc-wifi {
 		compatible = "regulator-fixed";
 		regulator-name = "VCC_WIFI";
@@ -378,6 +403,20 @@
 		 * bit 18), TCON_VCOM (PIN_MUX_1 bit 10) i SPDIF_in (PIN_MUX_3
 		 * bit 23) - wszystkie wyłączone. GPIOC_14 nie ma innej funkcji.
 		 */
+		/*
+		 * HDMI: HPD (GPIOC_10) PIN_MUX_1 bit 22, DDC SDA/SCL bits 23..24
+		 * (vendor hdmi_tx_hw.c; Android 720p: PIN_MUX_1 = 0x01c00000).
+		 */
+		hdmi_pins: hdmi-pins {
+			pinctrl-single,bits = <0x04 0x01c00000 0x01c00000>;
+		};
+
+		/* GPIOD_5 as GPIO: TCON_3_B (PIN_MUX_0 bit 25), PIN_MUX_1 bit 16 off */
+		hdmi_5v_pins: hdmi-5v-pins {
+			pinctrl-single,bits = <0x00 0x00000000 0x02000000>,
+					      <0x04 0x00000000 0x00010000>;
+		};
+
 		led_pins: led-pins {
 			pinctrl-single,bits = <0x00 0x00000000 0x00040000>,
 					      <0x04 0x00000000 0x00000400>,
@@ -482,6 +521,7 @@
 		clocks = <&xtal>;
 		clock-names = "xtal";
 		#clock-cells = <1>;
+		#reset-cells = <1>;
 	};
 };
 
@@ -682,4 +722,116 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&pwm_c_pins>;
 	status = "okay";
+};
+
+/*
+ * VPU: registers in CBUS (0xc1100000 + register * 4), like VCBUS on Meson8.
+ * The range overlaps other CBUS devices; the driver maps it without
+ * requesting it. Meson6 has no VPU power domain and no VPU interrupt gate
+ * (the ENCP interrupt gate is used as "vpu_intr").
+ */
+&cbus {
+	vpu: vpu@0 {
+		compatible = "amlogic,meson6-vpu";
+		reg = <0x0 0xa000>;
+		reg-names = "vpu";
+		interrupts = <GIC_SPI 3 IRQ_TYPE_EDGE_RISING>;
+		amlogic,canvas = <&canvas>;
+
+		assigned-clocks = <&clkc CLKID_VCLK_IN_SEL>,
+				  <&clkc CLKID_VCLK2_IN_SEL>;
+		assigned-clock-parents = <&clkc CLKID_VID_PLL_FINAL_DIV>,
+					 <&clkc CLKID_VID_PLL_FINAL_DIV>;
+
+		clocks = <&clkc CLKID_VPU_INTR>,
+			 <&clkc CLKID_HDMI_INTR_SYNC>,
+			 <&clkc CLKID_GCLK_VENCI_INT>,
+			 <&clkc CLKID_HDMI_PLL_HDMI_OUT>,
+			 <&clkc CLKID_HDMI_TX_PIXEL>,
+			 <&clkc CLKID_CTS_ENCP>,
+			 <&clkc CLKID_CTS_ENCI>,
+			 <&clkc CLKID_CTS_ENCT>,
+			 <&clkc CLKID_CTS_ENCL>,
+			 <&clkc CLKID_CTS_VDAC0>;
+		clock-names = "vpu_intr",
+			      "hdmi_intr_sync",
+			      "venci_int",
+			      "tmds",
+			      "hdmi_tx_pixel",
+			      "cts_encp",
+			      "cts_enci",
+			      "cts_enct",
+			      "cts_encl",
+			      "cts_vdac0";
+
+		resets = <&clkc CLKC_RESET_VID_DIVIDER_CNTL_RESET_N_PRE>,
+			 <&clkc CLKC_RESET_VID_DIVIDER_CNTL_RESET_N_POST>,
+			 <&clkc CLKC_RESET_VID_DIVIDER_CNTL_SOFT_RESET_PRE>,
+			 <&clkc CLKC_RESET_VID_DIVIDER_CNTL_SOFT_RESET_POST>;
+		reset-names = "vid_pll_pre",
+			      "vid_pll_post",
+			      "vid_pll_soft_pre",
+			      "vid_pll_soft_post";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* HDMI-TX output port */
+		port@1 {
+			reg = <1>;
+
+			vpu_hdmi_out: endpoint {
+				remote-endpoint = <&hdmi_tx_in>;
+			};
+		};
+	};
+};
+
+&{/soc} {
+	apb: bus@c8000000 {
+		compatible = "simple-bus";
+		reg = <0xc8000000 0x8000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0xc8000000 0x8000>;
+
+		/* HDMI_ADDR_PORT, HDMI_DATA_PORT, HDMI_CTRL_PORT */
+		hdmi_tx: hdmi-tx@2000 {
+			compatible = "amlogic,meson6-hdmi-tx";
+			reg = <0x2000 0xc>;
+			interrupts = <GIC_SPI 57 IRQ_TYPE_EDGE_RISING>;
+			clocks = <&clkc CLKID_HDMI_PCLK>,
+				 <&clkc CLKID_HDMI_SYS>;
+			clock-names = "pclk", "sys";
+			pinctrl-0 = <&hdmi_pins>;
+			pinctrl-names = "default";
+
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* VPU VENC input */
+			port@0 {
+				reg = <0>;
+
+				hdmi_tx_in: endpoint {
+					remote-endpoint = <&vpu_hdmi_out>;
+				};
+			};
+
+			/* TMDS output */
+			port@1 {
+				reg = <1>;
+
+				hdmi_tx_tmds_out: endpoint {
+					remote-endpoint = <&hdmi_connector_in>;
+				};
+			};
+		};
+
+		/* DC_CAV_LUT_DATAL/DATAH/ADDR (vendor dmc.h), same layout as Meson8 */
+		canvas: video-lut@6324 {
+			compatible = "amlogic,meson8-canvas", "amlogic,canvas";
+			reg = <0x6324 0x14>;
+		};
+	};
 };
