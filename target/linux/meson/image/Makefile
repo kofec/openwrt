@@ -27,8 +27,9 @@ define Device/Default
 	KERNEL_LOADADDR := 0x80008000
 	KERNEL_NAME := zImage
 	KERNEL := kernel-bin | append-dtb | uImage none
-	IMAGES := sdcard.img.gz
+	IMAGES := sdcard.img.gz sysupgrade.img.gz
 	IMAGE/sdcard.img.gz := meson-sdcard | gzip
+	IMAGE/sysupgrade.img.gz := meson-sdcard | gzip | append-metadata
 endef
 
 define Device/wetek_play
