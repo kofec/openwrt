@@ -1,0 +1,1205 @@
+From 15ebbab56b5344dbde4cc6df3b4e68c8e4cc2ad9 Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Fri, 13 Nov 2026 20:02:19 +0000
+Subject: [PATCH] clk: meson: meson6: add the video clocks
+
+Ported from meson8b.c (the register layout is the same), with the Meson6
+differences:
+- the video PLL (HPLL) is at HHI 0x270 instead of 0x320 and bit 30 of
+  HHI_VID_PLL_CNTL is a power-down bit, so it gets its own ops: reset,
+  analog settings (CNTL2..4 as on a running vendor system), M/N, wait
+  for lock. VCO 1080, 1296 and 1485MHz like in the vendor kernel.
+- the HDMI output divider uses 2 and 3 for divide-by-4.
+- there is no HHI_VID_CLK_CNTL2, so cts_enc*/hdmi_tx_pixel are muxes.
+- the HDMI/VENC gates in HHI_GCLK_MPEG2 are at different bits and
+  HDMI_INTR_SYNC, VENCI_INT and VENCP_INT must stay enabled: with them
+  gated the HDMI output has sync but black pixels.
+- reset lines for the video dividers like on Meson8b.
+---
+ drivers/clk/meson/meson6.c | 1107 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 1105 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/clk/meson/meson6.c b/drivers/clk/meson/meson6.c
+index fbc477ca0..272fd37a7 100644
+--- a/drivers/clk/meson/meson6.c
++++ b/drivers/clk/meson/meson6.c
+@@ -19,16 +19,29 @@
+ #include <linux/mfd/syscon.h>
+ #include <linux/of.h>
+ #include <linux/regmap.h>
++#include <linux/reset-controller.h>
++#include <linux/slab.h>
+ 
+ #include "clk-regmap.h"
+ #include "clk-pll.h"
+ #include "meson-clkc-utils.h"
+ 
+ #include <dt-bindings/clock/meson8b-clkc.h>
++#include <dt-bindings/reset/amlogic,meson8b-clkc-reset.h>
+ 
+ #define HHI_GCLK_MPEG0			0x140
+ #define HHI_GCLK_MPEG1			0x144
+ #define HHI_GCLK_MPEG2			0x148
++#define HHI_VIID_CLK_DIV		0x128
++#define HHI_VIID_CLK_CNTL		0x12c
++#define HHI_VID_CLK_DIV			0x164
++#define HHI_VID_CLK_CNTL		0x17c
++#define HHI_VID_DIVIDER_CNTL		0x198
++#define HHI_HDMI_CLK_CNTL		0x1cc
++#define HHI_VID_PLL_CNTL		0x270
++#define HHI_VID_PLL_CNTL2		0x274
++#define HHI_VID_PLL_CNTL3		0x278
++#define HHI_VID_PLL_CNTL4		0x27c
+ #define HHI_MPEG_CLK_CNTL		0x174
+ #define HHI_SYS_CPU_CLK_CNTL		0x19c
+ #define HHI_SYS_PLL_CNTL		0x260
+@@ -496,6 +509,978 @@ static struct clk_regmap meson6_clk_out3 = {
+ 	},
+ };
+ 
++/* video clocks, from meson8b.c */
++
++/*
++ * The video PLL (also called HPLL) uses the same register layout as the HDMI
++ * PLL on Meson8b, only at a different offset and without fractional part:
++ * VCO = 24MHz * M / N. The vendor kernel uses 1080MHz (M = 45, N = 1),
++ * 1296MHz (CVBS) and 1485MHz (M = 495, N = 8) for all HDMI modes, the latter
++ * with HHI_VID_PLL_CNTL3/4 values from the vendor's "exact 1485MHz" code path.
++ * HHI_VID_PLL_CNTL2..4 are as found on a running 720p vendor system.
++ */
++static const struct reg_sequence meson6_hdmi_pll_init_regs[] = {
++	{ .reg = HHI_VID_PLL_CNTL2,	.def = 0x814d3928 },
++	{ .reg = HHI_VID_PLL_CNTL3,	.def = 0x4b525012 },
++	{ .reg = HHI_VID_PLL_CNTL4,	.def = 0x02000101 },
++};
++
++static const struct pll_params_table meson6_hdmi_pll_params_table[] = {
++	PLL_PARAMS(45, 1),
++	PLL_PARAMS(54, 1),
++	PLL_PARAMS(495, 8),
++	{ /* sentinel */ }
++};
++
++/*
++ * Unlike on Meson8b, bit 30 of HHI_VID_PLL_CNTL is a power-down bit on Meson6
++ * (vendor: "0x105c[30]PD, 1: PowerDown"), so the generic PLL ops (which set it
++ * to enable the PLL) can't be used. The PLL is programmed like in the vendor
++ * kernel: reset, analog settings, M/N, release reset, wait for the lock bit.
++ */
++static int meson6_hdmi_pll_program(struct clk_regmap *clk, unsigned int m,
++				   unsigned int n)
++{
++	struct meson_clk_pll_data *pll = clk->data;
++	int delay = 5000;
++
++	meson_parm_write(clk->map, &pll->rst, 1);
++	regmap_multi_reg_write(clk->map, pll->init_regs, pll->init_count);
++	regmap_update_bits(clk->map, HHI_VID_PLL_CNTL, BIT(30), 0);
++	meson_parm_write(clk->map, &pll->m, m);
++	meson_parm_write(clk->map, &pll->n, n);
++	meson_parm_write(clk->map, &pll->rst, 0);
++
++	/* the lock bit is only valid after 100us */
++	udelay(100);
++	do {
++		if (meson_parm_read(clk->map, &pll->l))
++			return 0;
++		udelay(20);
++	} while (--delay);
++
++	pr_err("%s: the video PLL did not lock (M = %u, N = %u)\n", __func__,
++	       m, n);
++
++	return -EIO;
++}
++
++static unsigned long meson6_hdmi_pll_recalc_rate(struct clk_hw *hw,
++						 unsigned long parent_rate)
++{
++	return meson_clk_pll_ro_ops.recalc_rate(hw, parent_rate);
++}
++
++static const struct pll_params_table *
++meson6_hdmi_pll_find(struct meson_clk_pll_data *pll, unsigned long rate,
++		     unsigned long parent_rate)
++{
++	const struct pll_params_table *best = NULL, *t;
++	unsigned long best_diff = ULONG_MAX;
++
++	for (t = pll->table; t->n; t++) {
++		unsigned long r = DIV_ROUND_CLOSEST_ULL((u64)parent_rate * t->m,
++							t->n);
++		unsigned long diff = abs_diff(r, rate);
++
++		if (diff < best_diff) {
++			best = t;
++			best_diff = diff;
++		}
++	}
++
++	return best;
++}
++
++static int meson6_hdmi_pll_determine_rate(struct clk_hw *hw,
++					  struct clk_rate_request *req)
++{
++	struct clk_regmap *clk = to_clk_regmap(hw);
++	const struct pll_params_table *t;
++
++	if (!req->best_parent_rate)
++		return -EINVAL;
++
++	t = meson6_hdmi_pll_find(clk->data, req->rate, req->best_parent_rate);
++	if (!t)
++		return -EINVAL;
++
++	req->rate = DIV_ROUND_CLOSEST_ULL((u64)req->best_parent_rate * t->m,
++					  t->n);
++
++	return 0;
++}
++
++static int meson6_hdmi_pll_set_rate(struct clk_hw *hw, unsigned long rate,
++				    unsigned long parent_rate)
++{
++	struct clk_regmap *clk = to_clk_regmap(hw);
++	const struct pll_params_table *t;
++
++	t = meson6_hdmi_pll_find(clk->data, rate, parent_rate);
++	if (!t)
++		return -EINVAL;
++
++	return meson6_hdmi_pll_program(clk, t->m, t->n);
++}
++
++/* U-Boot leaves the PLL powered down or unlocked */
++static int meson6_hdmi_pll_prepare(struct clk_hw *hw)
++{
++	struct clk_regmap *clk = to_clk_regmap(hw);
++	struct meson_clk_pll_data *pll = clk->data;
++	unsigned int val;
++
++	regmap_read(clk->map, HHI_VID_PLL_CNTL, &val);
++	if (!(val & BIT(30)) && meson_parm_read(clk->map, &pll->l))
++		return 0;
++
++	return meson6_hdmi_pll_program(clk, meson_parm_read(clk->map, &pll->m),
++				       meson_parm_read(clk->map, &pll->n));
++}
++
++static int meson6_hdmi_pll_is_prepared(struct clk_hw *hw)
++{
++	struct clk_regmap *clk = to_clk_regmap(hw);
++	struct meson_clk_pll_data *pll = clk->data;
++	unsigned int val;
++
++	regmap_read(clk->map, HHI_VID_PLL_CNTL, &val);
++
++	return !(val & BIT(30)) && meson_parm_read(clk->map, &pll->l);
++}
++
++static const struct clk_ops meson6_hdmi_pll_ops = {
++	.prepare	= meson6_hdmi_pll_prepare,
++	.is_prepared	= meson6_hdmi_pll_is_prepared,
++	.recalc_rate	= meson6_hdmi_pll_recalc_rate,
++	.determine_rate	= meson6_hdmi_pll_determine_rate,
++	.set_rate	= meson6_hdmi_pll_set_rate,
++};
++
++static struct clk_regmap meson6_hdmi_pll_dco = {
++	.data = &(struct meson_clk_pll_data){
++		.m = {
++			.reg_off = HHI_VID_PLL_CNTL,
++			.shift   = 0,
++			.width   = 9,
++		},
++		.n = {
++			.reg_off = HHI_VID_PLL_CNTL,
++			.shift   = 10,
++			.width   = 5,
++		},
++		.l = {
++			.reg_off = HHI_VID_PLL_CNTL,
++			.shift   = 31,
++			.width   = 1,
++		},
++		.rst = {
++			.reg_off = HHI_VID_PLL_CNTL,
++			.shift   = 29,
++			.width   = 1,
++		},
++		.table = meson6_hdmi_pll_params_table,
++		.init_regs = meson6_hdmi_pll_init_regs,
++		.init_count = ARRAY_SIZE(meson6_hdmi_pll_init_regs),
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "hdmi_pll_dco",
++		.ops = &meson6_hdmi_pll_ops,
++		.parent_data = &meson6_xtal,
++		.num_parents = 1,
++	},
++};
++
++static struct clk_regmap meson6_hdmi_pll_lvds_out = {
++	.data = &(struct clk_regmap_div_data){
++		.offset = HHI_VID_PLL_CNTL,
++		.shift = 16,
++		.width = 2,
++		.flags = CLK_DIVIDER_POWER_OF_TWO,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "hdmi_pll_lvds_out",
++		.ops = &clk_regmap_divider_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_hdmi_pll_dco.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++/* divide-by-4: the vendor HDMI code writes 3, its PLL code 2 */
++static const struct clk_div_table meson6_hdmi_pll_hdmi_out_div_table[] = {
++	{ .val = 0, .div = 1 },
++	{ .val = 1, .div = 2 },
++	{ .val = 3, .div = 4 },
++	{ .val = 2, .div = 4 },
++	{ /* sentinel */ }
++};
++
++static struct clk_regmap meson6_hdmi_pll_hdmi_out = {
++	.data = &(struct clk_regmap_div_data){
++		.offset = HHI_VID_PLL_CNTL,
++		.shift = 18,
++		.width = 2,
++		.table = meson6_hdmi_pll_hdmi_out_div_table,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "hdmi_pll_hdmi_out",
++		.ops = &clk_regmap_divider_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_hdmi_pll_dco.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++/* also called LVDS_CLK_EN */
++static struct clk_regmap meson6_vid_pll_lvds_en = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VID_DIVIDER_CNTL,
++		.bit_idx = 11,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vid_pll_lvds_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_hdmi_pll_lvds_out.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vid_pll_in_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_VID_DIVIDER_CNTL,
++		.mask = 0x1,
++		.shift = 15,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vid_pll_in_sel",
++		.ops = &clk_regmap_mux_ops,
++		/*
++		 * TODO: depending on the SoC there is also a second parent:
++		 * Meson8: unknown
++		 * Meson8b: hdmi_pll_dco
++		 * Meson8m2: vid2_pll
++		 */
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vid_pll_lvds_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vid_pll_in_en = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VID_DIVIDER_CNTL,
++		.bit_idx = 16,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vid_pll_in_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vid_pll_in_sel.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vid_pll_pre_div = {
++	.data = &(struct clk_regmap_div_data){
++		.offset =  HHI_VID_DIVIDER_CNTL,
++		.shift = 4,
++		.width = 3,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vid_pll_pre_div",
++		.ops = &clk_regmap_divider_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vid_pll_in_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vid_pll_post_div = {
++	.data = &(struct clk_regmap_div_data){
++		.offset =  HHI_VID_DIVIDER_CNTL,
++		.shift = 12,
++		.width = 3,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vid_pll_post_div",
++		.ops = &clk_regmap_divider_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vid_pll_pre_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vid_pll = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_VID_DIVIDER_CNTL,
++		.mask = 0x3,
++		.shift = 8,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vid_pll",
++		.ops = &clk_regmap_mux_ops,
++		/* TODO: parent 0x2 is vid_pll_pre_div_mult7_div2 */
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vid_pll_pre_div.hw,
++			&meson6_vid_pll_post_div.hw,
++		},
++		.num_parents = 2,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vid_pll_final_div = {
++	.data = &(struct clk_regmap_div_data){
++		.offset =  HHI_VID_CLK_DIV,
++		.shift = 0,
++		.width = 8,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vid_pll_final_div",
++		.ops = &clk_regmap_divider_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vid_pll.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static const struct clk_hw *meson6_vclk_mux_parent_hws[] = {
++	&meson6_vid_pll_final_div.hw,
++	&meson6_fclk_div4.hw,
++	&meson6_fclk_div3.hw,
++	&meson6_fclk_div5.hw,
++	&meson6_vid_pll_final_div.hw,
++	&meson6_fclk_div7.hw,
++};
++
++static struct clk_regmap meson6_vclk_in_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_VID_CLK_CNTL,
++		.mask = 0x7,
++		.shift = 16,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_in_sel",
++		.ops = &clk_regmap_mux_ops,
++		.parent_hws = meson6_vclk_mux_parent_hws,
++		.num_parents = ARRAY_SIZE(meson6_vclk_mux_parent_hws),
++		.flags = CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT,
++	},
++};
++
++static struct clk_regmap meson6_vclk_in_en = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VID_CLK_DIV,
++		.bit_idx = 16,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_in_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk_in_sel.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vclk_en = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VID_CLK_CNTL,
++		.bit_idx = 19,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk_in_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vclk_div1_gate = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VID_CLK_CNTL,
++		.bit_idx = 0,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_div1_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_fixed_factor meson6_vclk_div2_div = {
++	.mult = 1,
++	.div = 2,
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_div2",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	}
++};
++
++static struct clk_regmap meson6_vclk_div2_div_gate = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VID_CLK_CNTL,
++		.bit_idx = 1,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_div2_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk_div2_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_fixed_factor meson6_vclk_div4_div = {
++	.mult = 1,
++	.div = 4,
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_div4",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	}
++};
++
++static struct clk_regmap meson6_vclk_div4_div_gate = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VID_CLK_CNTL,
++		.bit_idx = 2,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_div4_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk_div4_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_fixed_factor meson6_vclk_div6_div = {
++	.mult = 1,
++	.div = 6,
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_div6",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	}
++};
++
++static struct clk_regmap meson6_vclk_div6_div_gate = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VID_CLK_CNTL,
++		.bit_idx = 3,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_div6_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk_div6_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_fixed_factor meson6_vclk_div12_div = {
++	.mult = 1,
++	.div = 12,
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_div12",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	}
++};
++
++static struct clk_regmap meson6_vclk_div12_div_gate = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VID_CLK_CNTL,
++		.bit_idx = 4,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk_div12_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk_div12_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vclk2_in_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_VIID_CLK_CNTL,
++		.mask = 0x7,
++		.shift = 16,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_in_sel",
++		.ops = &clk_regmap_mux_ops,
++		.parent_hws = meson6_vclk_mux_parent_hws,
++		.num_parents = ARRAY_SIZE(meson6_vclk_mux_parent_hws),
++		.flags = CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT,
++	},
++};
++
++static struct clk_regmap meson6_vclk2_clk_in_en = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VIID_CLK_DIV,
++		.bit_idx = 16,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_in_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk2_in_sel.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vclk2_clk_en = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VIID_CLK_DIV,
++		.bit_idx = 19,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk2_clk_in_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vclk2_div1_gate = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VIID_CLK_DIV,
++		.bit_idx = 0,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_div1_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk2_clk_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_fixed_factor meson6_vclk2_div2_div = {
++	.mult = 1,
++	.div = 2,
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_div2",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk2_clk_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	}
++};
++
++static struct clk_regmap meson6_vclk2_div2_div_gate = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VIID_CLK_DIV,
++		.bit_idx = 1,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_div2_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk2_div2_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_fixed_factor meson6_vclk2_div4_div = {
++	.mult = 1,
++	.div = 4,
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_div4",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk2_clk_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	}
++};
++
++static struct clk_regmap meson6_vclk2_div4_div_gate = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VIID_CLK_DIV,
++		.bit_idx = 2,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_div4_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk2_div4_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_fixed_factor meson6_vclk2_div6_div = {
++	.mult = 1,
++	.div = 6,
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_div6",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk2_clk_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	}
++};
++
++static struct clk_regmap meson6_vclk2_div6_div_gate = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VIID_CLK_DIV,
++		.bit_idx = 3,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_div6_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk2_div6_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_fixed_factor meson6_vclk2_div12_div = {
++	.mult = 1,
++	.div = 12,
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_div12",
++		.ops = &clk_fixed_factor_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk2_clk_en.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	}
++};
++
++static struct clk_regmap meson6_vclk2_div12_div_gate = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VIID_CLK_DIV,
++		.bit_idx = 4,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vclk2_div12_en",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vclk2_div12_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static const struct clk_hw *meson6_vclk_enc_mux_parent_hws[] = {
++	&meson6_vclk_div1_gate.hw,
++	&meson6_vclk_div2_div_gate.hw,
++	&meson6_vclk_div4_div_gate.hw,
++	&meson6_vclk_div6_div_gate.hw,
++	&meson6_vclk_div12_div_gate.hw,
++};
++
++static struct clk_regmap meson6_cts_enct_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_VID_CLK_DIV,
++		.mask = 0xf,
++		.shift = 20,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "cts_enct_sel",
++		.ops = &clk_regmap_mux_ops,
++		.parent_hws = meson6_vclk_enc_mux_parent_hws,
++		.num_parents = ARRAY_SIZE(meson6_vclk_enc_mux_parent_hws),
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_cts_encp_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_VID_CLK_DIV,
++		.mask = 0xf,
++		.shift = 24,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "cts_encp_sel",
++		.ops = &clk_regmap_mux_ops,
++		.parent_hws = meson6_vclk_enc_mux_parent_hws,
++		.num_parents = ARRAY_SIZE(meson6_vclk_enc_mux_parent_hws),
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_cts_enci_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_VID_CLK_DIV,
++		.mask = 0xf,
++		.shift = 28,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "cts_enci_sel",
++		.ops = &clk_regmap_mux_ops,
++		.parent_hws = meson6_vclk_enc_mux_parent_hws,
++		.num_parents = ARRAY_SIZE(meson6_vclk_enc_mux_parent_hws),
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_hdmi_tx_pixel_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_HDMI_CLK_CNTL,
++		.mask = 0xf,
++		.shift = 16,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "hdmi_tx_pixel_sel",
++		.ops = &clk_regmap_mux_ops,
++		.parent_hws = meson6_vclk_enc_mux_parent_hws,
++		.num_parents = ARRAY_SIZE(meson6_vclk_enc_mux_parent_hws),
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static const struct clk_hw *meson6_vclk2_enc_mux_parent_hws[] = {
++	&meson6_vclk2_div1_gate.hw,
++	&meson6_vclk2_div2_div_gate.hw,
++	&meson6_vclk2_div4_div_gate.hw,
++	&meson6_vclk2_div6_div_gate.hw,
++	&meson6_vclk2_div12_div_gate.hw,
++};
++
++static struct clk_regmap meson6_cts_encl_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_VIID_CLK_DIV,
++		.mask = 0xf,
++		.shift = 12,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "cts_encl_sel",
++		.ops = &clk_regmap_mux_ops,
++		.parent_hws = meson6_vclk2_enc_mux_parent_hws,
++		.num_parents = ARRAY_SIZE(meson6_vclk2_enc_mux_parent_hws),
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_cts_vdac0_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_VIID_CLK_DIV,
++		.mask = 0xf,
++		.shift = 28,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "cts_vdac0_sel",
++		.ops = &clk_regmap_mux_ops,
++		.parent_hws = meson6_vclk2_enc_mux_parent_hws,
++		.num_parents = ARRAY_SIZE(meson6_vclk2_enc_mux_parent_hws),
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_hdmi_sys_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_HDMI_CLK_CNTL,
++		.mask = 0x3,
++		.shift = 9,
++		.flags = CLK_MUX_ROUND_CLOSEST,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "hdmi_sys_sel",
++		.ops = &clk_regmap_mux_ops,
++		/* FIXME: all other parents are unknown */
++		.parent_data = &(const struct clk_parent_data) {
++			.fw_name = "xtal",
++			.name = "xtal",
++			.index = -1,
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_NO_REPARENT,
++	},
++};
++
++static struct clk_regmap meson6_hdmi_sys_div = {
++	.data = &(struct clk_regmap_div_data){
++		.offset = HHI_HDMI_CLK_CNTL,
++		.shift = 0,
++		.width = 7,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "hdmi_sys_div",
++		.ops = &clk_regmap_divider_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_hdmi_sys_sel.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_hdmi_sys = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_HDMI_CLK_CNTL,
++		.bit_idx = 8,
++	},
++	.hw.init = &(struct clk_init_data) {
++		.name = "hdmi_sys",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_hdmi_sys_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++/*
++ * The VPU/VENC gates in HHI_GCLK_MPEG2 differ from Meson8b. There is no VPU
++ * interrupt gate, the VPU node uses the ENCP interrupt gate instead.
++ */
++static MESON6_GATE(meson6_hdmi_intr_sync, HHI_GCLK_MPEG2, 3);
++static MESON6_GATE(meson6_hdmi_pclk, HHI_GCLK_MPEG2, 4);
++static MESON6_GATE(meson6_gclk_venci_int, HHI_GCLK_MPEG2, 16);
++static MESON6_GATE(meson6_gclk_vencp_int, HHI_GCLK_MPEG2, 18);
++
++
++static DEFINE_SPINLOCK(meson6_clk_reset_lock);
++
++struct meson6_clk_reset {
++	struct reset_controller_dev reset;
++	struct regmap *regmap;
++};
++
++/* same lines as on Meson8b, see set_vid_pll_div() in the vendor kernel */
++static const struct meson6_clk_reset_line {
++	u32 reg;
++	u8 bit_idx;
++	bool active_low;
++} meson6_clk_reset_bits[] = {
++	[CLKC_RESET_VID_CLK_CNTL_SOFT_RESET] = {
++		.reg = HHI_VID_CLK_CNTL, .bit_idx = 15, .active_low = false,
++	},
++	[CLKC_RESET_VID_DIVIDER_CNTL_SOFT_RESET_POST] = {
++		.reg = HHI_VID_DIVIDER_CNTL, .bit_idx = 7, .active_low = false,
++	},
++	[CLKC_RESET_VID_DIVIDER_CNTL_SOFT_RESET_PRE] = {
++		.reg = HHI_VID_DIVIDER_CNTL, .bit_idx = 3, .active_low = false,
++	},
++	[CLKC_RESET_VID_DIVIDER_CNTL_RESET_N_POST] = {
++		.reg = HHI_VID_DIVIDER_CNTL, .bit_idx = 1, .active_low = true,
++	},
++	[CLKC_RESET_VID_DIVIDER_CNTL_RESET_N_PRE] = {
++		.reg = HHI_VID_DIVIDER_CNTL, .bit_idx = 0, .active_low = true,
++	},
++};
++
++static int meson6_clk_reset_update(struct reset_controller_dev *rcdev,
++				   unsigned long id, bool assert)
++{
++	struct meson6_clk_reset *rstc =
++		container_of(rcdev, struct meson6_clk_reset, reset);
++	const struct meson6_clk_reset_line *line;
++	unsigned int value = 0;
++	unsigned long flags;
++
++	if (id >= ARRAY_SIZE(meson6_clk_reset_bits))
++		return -EINVAL;
++
++	line = &meson6_clk_reset_bits[id];
++	if (!line->reg)
++		return -EINVAL;
++
++	if (assert != line->active_low)
++		value = BIT(line->bit_idx);
++
++	spin_lock_irqsave(&meson6_clk_reset_lock, flags);
++	regmap_update_bits(rstc->regmap, line->reg, BIT(line->bit_idx), value);
++	spin_unlock_irqrestore(&meson6_clk_reset_lock, flags);
++
++	return 0;
++}
++
++static int meson6_clk_reset_assert(struct reset_controller_dev *rcdev,
++				   unsigned long id)
++{
++	return meson6_clk_reset_update(rcdev, id, true);
++}
++
++static int meson6_clk_reset_deassert(struct reset_controller_dev *rcdev,
++				     unsigned long id)
++{
++	return meson6_clk_reset_update(rcdev, id, false);
++}
++
++static const struct reset_control_ops meson6_clk_reset_ops = {
++	.assert = meson6_clk_reset_assert,
++	.deassert = meson6_clk_reset_deassert,
++};
++
+ /* clocks which are not exposed through the DT binding, parents first */
+ static struct clk_hw *meson6_internal_hws[] = {
+ 	&meson6_fixed_pll_dco.hw,
+@@ -504,6 +1489,7 @@ static struct clk_hw *meson6_internal_hws[] = {
+ 	&meson6_cpu_in_div2.hw,
+ 	&meson6_cpu_in_div3.hw,
+ 	&meson6_cpu_scale_out_sel.hw,
++
+ };
+ 
+ static struct clk_hw *meson6_hw_clks[] = {
+@@ -534,6 +1520,59 @@ static struct clk_hw *meson6_hw_clks[] = {
+ 	[CLKID_UART2]			= &meson6_uart2.hw,
+ 	[CLKID_PERIPH]			= &meson6_periph_clk.hw,
+ 	[MESON6_CLKID_CLK_OUT3]		= &meson6_clk_out3.hw,
++	[CLKID_HDMI_PLL_DCO] = &meson6_hdmi_pll_dco.hw,
++	[CLKID_HDMI_PLL_LVDS_OUT] = &meson6_hdmi_pll_lvds_out.hw,
++	[CLKID_HDMI_PLL_HDMI_OUT] = &meson6_hdmi_pll_hdmi_out.hw,
++	[CLKID_VID_PLL_LVDS_EN] = &meson6_vid_pll_lvds_en.hw,
++	[CLKID_VID_PLL_IN_SEL] = &meson6_vid_pll_in_sel.hw,
++	[CLKID_VID_PLL_IN_EN] = &meson6_vid_pll_in_en.hw,
++	[CLKID_VID_PLL_PRE_DIV] = &meson6_vid_pll_pre_div.hw,
++	[CLKID_VID_PLL_POST_DIV] = &meson6_vid_pll_post_div.hw,
++	[CLKID_PLL_VID] = &meson6_vid_pll.hw,
++	[CLKID_VID_PLL_FINAL_DIV] = &meson6_vid_pll_final_div.hw,
++	[CLKID_VCLK_IN_SEL] = &meson6_vclk_in_sel.hw,
++	[CLKID_VCLK_IN_EN] = &meson6_vclk_in_en.hw,
++	[CLKID_VCLK_EN] = &meson6_vclk_en.hw,
++	[CLKID_VCLK_DIV1] = &meson6_vclk_div1_gate.hw,
++	[CLKID_VCLK_DIV2_DIV] = &meson6_vclk_div2_div.hw,
++	[CLKID_VCLK_DIV2] = &meson6_vclk_div2_div_gate.hw,
++	[CLKID_VCLK_DIV4_DIV] = &meson6_vclk_div4_div.hw,
++	[CLKID_VCLK_DIV4] = &meson6_vclk_div4_div_gate.hw,
++	[CLKID_VCLK_DIV6_DIV] = &meson6_vclk_div6_div.hw,
++	[CLKID_VCLK_DIV6] = &meson6_vclk_div6_div_gate.hw,
++	[CLKID_VCLK_DIV12_DIV] = &meson6_vclk_div12_div.hw,
++	[CLKID_VCLK_DIV12] = &meson6_vclk_div12_div_gate.hw,
++	[CLKID_VCLK2_IN_SEL] = &meson6_vclk2_in_sel.hw,
++	[CLKID_VCLK2_IN_EN] = &meson6_vclk2_clk_in_en.hw,
++	[CLKID_VCLK2_EN] = &meson6_vclk2_clk_en.hw,
++	[CLKID_VCLK2_DIV1] = &meson6_vclk2_div1_gate.hw,
++	[CLKID_VCLK2_DIV2_DIV] = &meson6_vclk2_div2_div.hw,
++	[CLKID_VCLK2_DIV2] = &meson6_vclk2_div2_div_gate.hw,
++	[CLKID_VCLK2_DIV4_DIV] = &meson6_vclk2_div4_div.hw,
++	[CLKID_VCLK2_DIV4] = &meson6_vclk2_div4_div_gate.hw,
++	[CLKID_VCLK2_DIV6_DIV] = &meson6_vclk2_div6_div.hw,
++	[CLKID_VCLK2_DIV6] = &meson6_vclk2_div6_div_gate.hw,
++	[CLKID_VCLK2_DIV12_DIV] = &meson6_vclk2_div12_div.hw,
++	[CLKID_VCLK2_DIV12] = &meson6_vclk2_div12_div_gate.hw,
++	[CLKID_CTS_ENCT_SEL] = &meson6_cts_enct_sel.hw,
++	[CLKID_CTS_ENCP_SEL] = &meson6_cts_encp_sel.hw,
++	[CLKID_CTS_ENCI_SEL] = &meson6_cts_enci_sel.hw,
++	[CLKID_HDMI_TX_PIXEL_SEL] = &meson6_hdmi_tx_pixel_sel.hw,
++	[CLKID_CTS_ENCL_SEL] = &meson6_cts_encl_sel.hw,
++	[CLKID_CTS_VDAC0_SEL] = &meson6_cts_vdac0_sel.hw,
++	[CLKID_HDMI_SYS_SEL] = &meson6_hdmi_sys_sel.hw,
++	[CLKID_HDMI_SYS_DIV] = &meson6_hdmi_sys_div.hw,
++	[CLKID_HDMI_SYS] = &meson6_hdmi_sys.hw,
++	[CLKID_CTS_ENCT] = &meson6_cts_enct_sel.hw,
++	[CLKID_CTS_ENCP] = &meson6_cts_encp_sel.hw,
++	[CLKID_CTS_ENCI] = &meson6_cts_enci_sel.hw,
++	[CLKID_HDMI_TX_PIXEL] = &meson6_hdmi_tx_pixel_sel.hw,
++	[CLKID_CTS_ENCL] = &meson6_cts_encl_sel.hw,
++	[CLKID_CTS_VDAC0] = &meson6_cts_vdac0_sel.hw,
++	[CLKID_HDMI_INTR_SYNC] = &meson6_hdmi_intr_sync.hw,
++	[CLKID_HDMI_PCLK] = &meson6_hdmi_pclk.hw,
++	[CLKID_GCLK_VENCI_INT] = &meson6_gclk_venci_int.hw,
++	[CLKID_VPU_INTR] = &meson6_gclk_vencp_int.hw,
+ };
+ 
+ static struct clk_regmap *const meson6_clk_regmaps[] = {
+@@ -561,6 +1600,45 @@ static struct clk_regmap *const meson6_clk_regmaps[] = {
+ 	&meson6_usb0_ddr_bridge,
+ 	&meson6_uart2,
+ 	&meson6_clk_out3,
++	&meson6_hdmi_pll_dco,
++	&meson6_hdmi_pll_lvds_out,
++	&meson6_hdmi_pll_hdmi_out,
++	&meson6_vid_pll_lvds_en,
++	&meson6_vid_pll_in_sel,
++	&meson6_vid_pll_in_en,
++	&meson6_vid_pll_pre_div,
++	&meson6_vid_pll_post_div,
++	&meson6_vid_pll,
++	&meson6_vid_pll_final_div,
++	&meson6_vclk_in_sel,
++	&meson6_vclk_in_en,
++	&meson6_vclk_en,
++	&meson6_vclk_div1_gate,
++	&meson6_vclk_div2_div_gate,
++	&meson6_vclk_div4_div_gate,
++	&meson6_vclk_div6_div_gate,
++	&meson6_vclk_div12_div_gate,
++	&meson6_vclk2_in_sel,
++	&meson6_vclk2_clk_in_en,
++	&meson6_vclk2_clk_en,
++	&meson6_vclk2_div1_gate,
++	&meson6_vclk2_div2_div_gate,
++	&meson6_vclk2_div4_div_gate,
++	&meson6_vclk2_div6_div_gate,
++	&meson6_vclk2_div12_div_gate,
++	&meson6_cts_enct_sel,
++	&meson6_cts_encp_sel,
++	&meson6_cts_enci_sel,
++	&meson6_hdmi_tx_pixel_sel,
++	&meson6_cts_encl_sel,
++	&meson6_cts_vdac0_sel,
++	&meson6_hdmi_sys_sel,
++	&meson6_hdmi_sys_div,
++	&meson6_hdmi_sys,
++	&meson6_hdmi_intr_sync,
++	&meson6_hdmi_pclk,
++	&meson6_gclk_venci_int,
++	&meson6_gclk_vencp_int,
+ };
+ 
+ static struct meson_clk_hw_data meson6_clk_hw_data = {
+@@ -570,6 +1648,7 @@ static struct meson_clk_hw_data meson6_clk_hw_data = {
+ 
+ static void __init meson6_clkc_init(struct device_node *np)
+ {
++	struct meson6_clk_reset *rstc;
+ 	struct device_node *parent_np;
+ 	struct regmap *map;
+ 	int i, ret;
+@@ -585,6 +1664,21 @@ static void __init meson6_clkc_init(struct device_node *np)
+ 	for (i = 0; i < ARRAY_SIZE(meson6_clk_regmaps); i++)
+ 		meson6_clk_regmaps[i]->map = map;
+ 
++	rstc = kzalloc(sizeof(*rstc), GFP_KERNEL);
++	if (!rstc)
++		return;
++
++	rstc->regmap = map;
++	rstc->reset.ops = &meson6_clk_reset_ops;
++	rstc->reset.nr_resets = ARRAY_SIZE(meson6_clk_reset_bits);
++	rstc->reset.of_node = np;
++	ret = reset_controller_register(&rstc->reset);
++	if (ret) {
++		pr_err("%s: failed to register the reset controller: %d\n",
++		       __func__, ret);
++		return;
++	}
++
+ 	/* source and divider of CLK_OUT3 as set up by the vendor kernel */
+ 	regmap_update_bits(map, HHI_GEN_CLK_CNTL2, BIT(22) | GENMASK(18, 13),
+ 			   BIT(22));
+@@ -596,8 +1690,8 @@ static void __init meson6_clkc_init(struct device_node *np)
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(meson6_hw_clks); i++) {
+-		/* the array is sparse */
+-		if (!meson6_hw_clks[i])
++		/* the array is sparse, some IDs share a clock */
++		if (!meson6_hw_clks[i] || meson6_hw_clks[i]->core)
+ 			continue;
+ 
+ 		ret = of_clk_hw_register(np, meson6_hw_clks[i]);
+@@ -613,6 +1707,15 @@ static void __init meson6_clkc_init(struct device_node *np)
+ 		return;
+ 	}
+ 
++	/*
++	 * With HDMI_INTR_SYNC, VENCI_INT and VENCP_INT gated the HDMI output
++	 * has valid sync but black pixels (found on the WeTek Play; the vendor
++	 * kernel never gates them). Keep them enabled.
++	 */
++	clk_prepare_enable(meson6_hdmi_intr_sync.hw.clk);
++	clk_prepare_enable(meson6_gclk_venci_int.hw.clk);
++	clk_prepare_enable(meson6_gclk_vencp_int.hw.clk);
++
+ 	ret = of_clk_add_hw_provider(np, meson_clk_hw_get, &meson6_clk_hw_data);
+ 	if (ret)
+ 		pr_err("%s: failed to register the clock provider\n", __func__);

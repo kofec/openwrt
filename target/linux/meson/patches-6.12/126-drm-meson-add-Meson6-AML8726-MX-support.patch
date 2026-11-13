@@ -1,0 +1,280 @@
+From 43a179d6f95d367a890ba1b44e2d264de938e063 Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Fri, 13 Nov 2026 20:02:19 +0000
+Subject: [PATCH] drm/meson: add Meson6 (AML8726-MX) support
+
+Meson6 is handled like Meson8 with these differences:
+- the VPU registers are part of the shared CBUS area, they are mapped
+  without requesting the region.
+- the OSD global alpha is 8 bits wide (0x100 = transparent).
+- the HDMI TX (same TranSwitch IP and register map as Meson8) has no
+  separate PHY, it is programmed through TX_HDMI_PHY_CONFIG0..6 with the
+  vendor values; HDCP/ROM registers are set up before reading the EDID;
+  bits 5 and 6 of TX_SYS5_TX_SOFT_RESET_2 are inverted (vendor: 0x60).
+- only 27, 74.25 and 148.5MHz TMDS rates (480p/576p, 720p/1080i, 1080p).
+- the framebuffer uses RGB888 on Meson6/8 (6.12 has no
+  drm_client_setup_with_fourcc yet).
+---
+ drivers/gpu/drm/meson/meson_drv.c             | 41 +++++++--
+ drivers/gpu/drm/meson/meson_drv.h             |  1 +
+ drivers/gpu/drm/meson/meson_plane.c           |  8 +-
+ drivers/gpu/drm/meson/meson_transwitch_hdmi.c | 89 ++++++++++++++++++-
+ 4 files changed, 128 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_drv.c b/drivers/gpu/drm/meson/meson_drv.c
+index bea506326..8aa6f8630 100644
+--- a/drivers/gpu/drm/meson/meson_drv.c
++++ b/drivers/gpu/drm/meson/meson_drv.c
+@@ -250,6 +250,8 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 	priv->drm = drm;
+ 	priv->dev = dev;
+ 	priv->compat = match->compat;
++	priv->is_meson6 = of_device_is_compatible(dev->of_node,
++						  "amlogic,meson6-vpu");
+ 	priv->afbcd.ops = match->afbcd_ops;
+ 
+ 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_M8) ||
+@@ -301,10 +303,27 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 	if (ret)
+ 		goto free_drm;
+ 
+-	regs = devm_platform_ioremap_resource_byname(pdev, "vpu");
+-	if (IS_ERR(regs)) {
+-		ret = PTR_ERR(regs);
+-		goto video_clock_exit;
++	/*
++	 * On Meson6 the VPU registers are part of the CBUS area which is shared
++	 * with many other devices, so don't request the memory region there.
++	 */
++	if (of_device_is_compatible(dev->of_node, "amlogic,meson6-vpu")) {
++		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vpu");
++		if (!res) {
++			ret = -EINVAL;
++			goto video_clock_exit;
++		}
++		regs = devm_ioremap(dev, res->start, resource_size(res));
++		if (!regs) {
++			ret = -EADDRNOTAVAIL;
++			goto video_clock_exit;
++		}
++	} else {
++		regs = devm_platform_ioremap_resource_byname(pdev, "vpu");
++		if (IS_ERR(regs)) {
++			ret = PTR_ERR(regs);
++			goto video_clock_exit;
++		}
+ 	}
+ 
+ 	priv->io_base = regs;
+@@ -445,7 +464,16 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 	if (ret)
+ 		goto uninstall_irq;
+ 
+-	drm_fbdev_dma_setup(drm, 32);
++	/*
++	 * All SoC generations before GXBB can't configure the alpha value for
++	 * the X component of XRGB8888, use RGB888 for the framebuffer console.
++	 */
++	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_M8) ||
++	    meson_vpu_is_compatible(priv, VPU_COMPATIBLE_M8B) ||
++	    meson_vpu_is_compatible(priv, VPU_COMPATIBLE_M8M2))
++		drm_fbdev_dma_setup(drm, 24);
++	else
++		drm_fbdev_dma_setup(drm, 32);
+ 
+ 	return 0;
+ 
+@@ -650,6 +678,9 @@ static struct meson_drm_match_data meson_drm_g12a_data = {
+ };
+ 
+ static const struct of_device_id dt_match[] = {
++	/* Meson6 is handled like Meson8, see meson_drv_bind_master() */
++	{ .compatible = "amlogic,meson6-vpu",
++	  .data       = (void *)&meson_drm_m8_data },
+ 	{ .compatible = "amlogic,meson8-vpu",
+ 	  .data       = (void *)&meson_drm_m8_data },
+ 	{ .compatible = "amlogic,meson8b-vpu",
+diff --git a/drivers/gpu/drm/meson/meson_drv.h b/drivers/gpu/drm/meson/meson_drv.h
+index fdbd8a6aa..d79197d7f 100644
+--- a/drivers/gpu/drm/meson/meson_drv.h
++++ b/drivers/gpu/drm/meson/meson_drv.h
+@@ -69,6 +69,7 @@ enum vpu_bulk_vid_pll_reset_id {
+ struct meson_drm {
+ 	struct device *dev;
+ 	enum vpu_compatible compat;
++	bool is_meson6;
+ 	void __iomem *io_base;
+ 	struct regmap *hhi;
+ 	int vsync_irq;
+diff --git a/drivers/gpu/drm/meson/meson_plane.c b/drivers/gpu/drm/meson/meson_plane.c
+index 47d2f8328..71dc47248 100644
+--- a/drivers/gpu/drm/meson/meson_plane.c
++++ b/drivers/gpu/drm/meson/meson_plane.c
+@@ -167,9 +167,13 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 	else
+ 		priv->viu.osd1_afbcd = false;
+ 
+-	/* Enable OSD and BLK0, set max global alpha */
++	/*
++	 * Enable OSD and BLK0, set max global alpha. Meson6 has an 8-bit
++	 * global alpha (0x100 is fully transparent there).
++	 */
+ 	priv->viu.osd1_ctrl_stat = OSD_ENABLE |
+-				   (0x100 << OSD_GLOBAL_ALPHA_SHIFT) |
++				   ((priv->is_meson6 ? 0xff : 0x100) <<
++				    OSD_GLOBAL_ALPHA_SHIFT) |
+ 				   OSD_BLK0_ENABLE;
+ 
+ 	priv->viu.osd1_ctrl_stat2 = readl(priv->io_base +
+diff --git a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c
+index 1a0a65dad..aa274ec42 100644
+--- a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c
++++ b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c
+@@ -44,6 +44,9 @@ struct meson_txc_hdmi {
+ 	struct phy			*phy;
+ 	bool				phy_is_on;
+ 
++	/* Meson6: the PHY is controlled by TX_HDMI_PHY_CONFIG0..6 */
++	bool				internal_phy;
++
+ 	struct drm_bridge		bridge;
+ 	struct drm_bridge		*next_bridge;
+ };
+@@ -566,6 +569,38 @@ meson_txc_hdmi_bridge_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
+ 	return input_fmts;
+ }
+ 
++/*
++ * Meson6 has no separate HDMI PHY (Meson8 has one in the HHI registers). The
++ * values are taken from the vendor kernel (hdmi_hw_set_powermode() and the
++ * board specific "phy-data" of the WeTek Play) and match the registers of a
++ * running 720p vendor system.
++ */
++static void meson_txc_hdmi_internal_phy_on(struct meson_txc_hdmi *priv,
++					   unsigned long long tmds_rate)
++{
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG1, 0xfe);
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG2, 0xff);
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG3, 0xf7);
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG4, 0x22);
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG5, 0xe7);
++	/* swing: 0x30 up to 27MHz (480p/576p), 0x40 for 720p/1080i/1080p */
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG6,
++		     tmds_rate <= 27000000ULL ? 0x30 : 0x40);
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG0, 0xfe);
++}
++
++static void meson_txc_hdmi_internal_phy_off(struct meson_txc_hdmi *priv)
++{
++	/* "sleep" values from the vendor's hdmi_phy_suspend() */
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG0, 0xc0);
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG1, 0xf1);
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG2, 0xff);
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG3, 0x07);
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG4, 0x00);
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG5, 0x04);
++	regmap_write(priv->regmap, TX_HDMI_PHY_CONFIG6, 0x30);
++}
++
+ static void meson_txc_hdmi_bridge_atomic_enable(struct drm_bridge *bridge,
+ 						struct drm_bridge_state *old_bridge_state)
+ {
+@@ -691,11 +726,26 @@ static void meson_txc_hdmi_bridge_atomic_enable(struct drm_bridge *bridge,
+ 			     TX_SYS5_TX_SOFT_RESET_2_TX_DIG_RESET_N_CH3);
+ 		usleep_range(5000, 10000);
+ 		regmap_write(priv->regmap, TX_SYS5_TX_SOFT_RESET_1, 0x00);
+-		regmap_write(priv->regmap, TX_SYS5_TX_SOFT_RESET_2, 0x00);
++		/*
++		 * Meson6: bits 5 and 6 (CH1/CH2) are inverted, the vendor
++		 * kernel writes 0x60 here. With 0x00 the TV gets sync only.
++		 */
++		regmap_write(priv->regmap, TX_SYS5_TX_SOFT_RESET_2,
++			     priv->internal_phy ?
++			     (TX_SYS5_TX_SOFT_RESET_2_HDMI_CH2_RST_IN |
++			      TX_SYS5_TX_SOFT_RESET_2_HDMI_CH1_RST_IN) : 0x00);
+ 		usleep_range(5000, 10000);
+ 	}
+ 
+-	if (!priv->phy_is_on) {
++	if (priv->internal_phy) {
++		struct drm_crtc_state *cs =
++			drm_atomic_get_new_crtc_state(state, conn_state->crtc);
++
++		meson_txc_hdmi_internal_phy_on(priv, cs ?
++			(unsigned long long)cs->adjusted_mode.crtc_clock * 1000 :
++			0);
++		priv->phy_is_on = true;
++	} else if (!priv->phy_is_on) {
+ 		int ret;
+ 
+ 		ret = phy_power_on(priv->phy);
+@@ -711,7 +761,10 @@ static void meson_txc_hdmi_bridge_atomic_disable(struct drm_bridge *bridge,
+ {
+ 	struct meson_txc_hdmi *priv = bridge_to_meson_txc_hdmi(bridge);
+ 
+-	if (priv->phy_is_on) {
++	if (priv->phy_is_on && priv->internal_phy) {
++		meson_txc_hdmi_internal_phy_off(priv);
++		priv->phy_is_on = false;
++	} else if (priv->phy_is_on) {
+ 		int ret;
+ 
+ 		ret = phy_power_off(priv->phy);
+@@ -805,6 +858,25 @@ meson_txc_hdmi_tmds_char_rate_valid(const struct drm_bridge *bridge,
+ 				    const struct drm_display_mode *mode,
+ 				    unsigned long long tmds_rate)
+ {
++	const struct meson_txc_hdmi *priv =
++		container_of(bridge, struct meson_txc_hdmi, bridge);
++
++	/*
++	 * Meson6: the vendor kernel supports 480p/576p (27MHz), 720p/1080i
++	 * (74.25MHz) and 1080p (148.5MHz) only, all derived from a 1080MHz or
++	 * 1485MHz video PLL.
++	 */
++	if (priv->internal_phy) {
++		switch (tmds_rate) {
++		case 27000000:
++		case 74250000:
++		case 148500000:
++			return MODE_OK;
++		default:
++			return MODE_CLOCK_RANGE;
++		}
++	}
++
+ 	/* 297 MHz for 4k@30 mode (HDMI 1.4) */
+ 	if (tmds_rate > 297000000)
+ 		return MODE_CLOCK_HIGH;
+@@ -1150,6 +1222,9 @@ static int meson_txc_hdmi_hw_init(struct meson_txc_hdmi *priv,
+ 
+ 	regmap_write(priv->regmap, TX_HDCP_MODE, TX_HDCP_MODE_ESS_CONFIG);
+ 
++	if (priv->internal_phy)
++		meson_txc_hdmi_config_hdcp_registers(priv);
++
+ 	/*
+ 	 * The vendor driver comments that this is a setting for "Band-gap and
+ 	 * main-bias". 0x1d = power-up, 0x00 = power-down.
+@@ -1257,7 +1332,12 @@ static int meson_txc_hdmi_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(priv->sys_clk),
+ 				     "Failed to get the sys clock\n");
+ 
+-	priv->phy = devm_phy_get(dev, "hdmi");
++	priv->internal_phy = of_device_is_compatible(dev->of_node,
++						     "amlogic,meson6-hdmi-tx");
++	if (priv->internal_phy)
++		priv->phy = NULL;
++	else
++		priv->phy = devm_phy_get(dev, "hdmi");
+ 	if (IS_ERR(priv->phy))
+ 		return dev_err_probe(dev, PTR_ERR(priv->phy),
+ 				     "Failed to get the HDMI PHY\n");
+@@ -1332,6 +1412,7 @@ static void meson_txc_hdmi_remove(struct platform_device *pdev)
+ }
+ 
+ static const struct of_device_id meson_txc_hdmi_of_table[] = {
++	{ .compatible = "amlogic,meson6-hdmi-tx" },
+ 	{ .compatible = "amlogic,meson8-hdmi-tx" },
+ 	{ .compatible = "amlogic,meson8b-hdmi-tx" },
+ 	{ /* sentinel */ }
