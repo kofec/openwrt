@@ -27,6 +27,10 @@
 	compatible = "wetek,play", "amlogic,meson6";
 
 	aliases {
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-running = &led_power;
+		led-upgrade = &led_power;
 		serial0 = &uart_AO;
 		ethernet0 = &ethmac;
 		mmc0 = &sd_slot;
@@ -60,14 +64,21 @@
 
 	/*
 	 * Diody na froncie (vendor: drivers/leds/leds-wetekplay.c): wifi na
-	 * GPIOC_8, eth na GPIOC_14, obie świecą stanem wysokim. Trzecia, power
-	 * (niebieska/czerwona), wisi na pinie TEST_n sterowanym z AO 0x24 bit 31
-	 * i rejestru w secbus - na razie zostaje tak, jak ustawił ją U-Boot.
+	 * GPIOC_8, eth na GPIOC_14, obie świecą stanem wysokim. Power jest
+	 * dwukolorowa na pinie TEST_n: stan wysoki = żółta (vendor nazywa ją
+	 * "blue"), niski = czerwona - sprawdzone pod Androidem 2026-11-13.
 	 */
 	leds {
 		compatible = "gpio-leds";
 		pinctrl-names = "default";
 		pinctrl-0 = <&led_pins>;
+
+		led_power: led-power {
+			color = <LED_COLOR_ID_YELLOW>;
+			function = LED_FUNCTION_POWER;
+			gpios = <&gpio_test_n 31 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
 
 		led-wlan {
 			color = <LED_COLOR_ID_BLUE>;
@@ -335,6 +346,41 @@
 			pinctrl-single,bits = <0x0 0x00000001 0x00000001>;
 		};
 	};
+
+	/*
+	 * Pin TEST_n (dioda power): wartość w AO_GPIO_O_EN_N (0x24) bit 31,
+	 * odczyt w AO_GPIO_I (0x28) bit 31. Pozostałe bity 0x24 to wyjścia
+	 * i kierunki pinów GPIOAO; gpio-mmio zapisuje cały rejestr z kopii
+	 * odczytanej przy starcie, więc ich nie zmienia.
+	 */
+	gpio_test_n: gpio@28 {
+		compatible = "wd,mbl-gpio";
+		reg = <0x28 0x4>, <0x24 0x4>;
+		reg-names = "dat", "set";
+		#gpio-cells = <2>;
+		gpio-controller;
+	};
+};
+
+&secbus {
+	/*
+	 * SECBUS2 reg 0 bit 0 przełącza TEST_n w tryb wyjścia (vendor:
+	 * SECBUS2_REG_ADDR(0)); pod Androidem rejestr ma 0x00000001.
+	 */
+	gpio_test_n_oe: gpio@4000 {
+		compatible = "wd,mbl-gpio";
+		reg = <0x4000 0x4>;
+		reg-names = "dat";
+		#gpio-cells = <2>;
+		gpio-controller;
+
+		test-n-output-hog {
+			gpio-hog;
+			gpios = <0 GPIO_ACTIVE_HIGH>;
+			output-high;
+			line-name = "TEST_n output enable";
+		};
+	};
 };
 
 /*
@@ -492,7 +538,6 @@
 
 /*
  * Jeszcze nie zrobione:
- *  - dioda power (pin TEST_n, patrz węzeł leds),
  *  - NAND 0xc1108600: brak sterownika w mainline.
  */
 
