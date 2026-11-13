@@ -516,6 +516,12 @@
 		clocks = <&clkc 250>;
 		clock-names = "lpo";
 		max-speed = <2000000>;
+		/*
+		 * Łata BCM20702A1.hcd ustawia adres 20:70:02:a0:00:00, który
+		 * btbcm uznaje za nieważny, a w efuse adresu BT nie ma. To
+		 * 22:22:61:14:30:69 (little-endian), który wylosował Android.
+		 */
+		local-bd-address = [69 30 14 61 22 22];
 	};
 };
 
