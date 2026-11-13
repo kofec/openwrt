@@ -405,10 +405,11 @@
 		 */
 		/*
 		 * HDMI: HPD (GPIOC_10) PIN_MUX_1 bit 22, DDC SDA/SCL bits 23..24
-		 * (vendor hdmi_tx_hw.c; Android 720p: PIN_MUX_1 = 0x01c00000).
+		 * (vendor hdmi_tx_hw.c; Android 720p: PIN_MUX_1 = 0x01c00000),
+		 * CEC (GPIOC_13) bit 25 (vendor hdmi_tx_cec.c, Meson6).
 		 */
 		hdmi_pins: hdmi-pins {
-			pinctrl-single,bits = <0x04 0x01c00000 0x01c00000>;
+			pinctrl-single,bits = <0x04 0x03c00000 0x03c00000>;
 		};
 
 		/* GPIOD_5 as GPIO: TCON_3_B (PIN_MUX_0 bit 25), PIN_MUX_1 bit 16 off */
@@ -799,7 +800,9 @@
 		hdmi_tx: hdmi-tx@2000 {
 			compatible = "amlogic,meson6-hdmi-tx";
 			reg = <0x2000 0xc>;
-			interrupts = <GIC_SPI 57 IRQ_TYPE_EDGE_RISING>;
+			interrupts = <GIC_SPI 57 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SPI 55 IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "hdmi", "cec";
 			clocks = <&clkc CLKID_HDMI_PCLK>,
 				 <&clkc CLKID_HDMI_SYS>;
 			clock-names = "pclk", "sys";
