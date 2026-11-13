@@ -530,6 +530,8 @@
 	phy-mode = "rmii";
 	clocks = <&clkc CLKID_ETH>;
 	clock-names = "stmmaceth";
+	nvmem-cells = <&eth_mac>;
+	nvmem-cell-names = "mac-address";
 };
 
 /*
@@ -638,11 +640,17 @@
 /*
  * efuse tylko do odczytu w /sys/bus/nvmem. meson6.dtsi wyłącza go, bo
  * mainline nie miał dla Meson6 zegarów; bramkę daje meson6-clkc.
+ * MAC Ethernetu leży jawnie pod 0x1b4, ten sam co mac= od U-Boota
+ * (zrzut 2026-11-13; vendorski Android pokazuje go jako efuse/mac).
  */
 &efuse {
 	clocks = <&clkc CLKID_EFUSE>;
 	clock-names = "core";
 	status = "okay";
+
+	eth_mac: mac@1b4 {
+		reg = <0x1b4 0x6>;
+	};
 };
 
 /*
