@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Dioda eth jak u vendora (ethlink) plus mruganie przy ruchu. Dioda wifi
+# zostaje bez wyzwalacza: brcmfmac nie ma wyzwalaczy phy0*, a nazwa
+# interfejsu zależy od trybu Wi-Fi - do ustawienia w LuCI.
+
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+wetek,play)
+	ucidef_set_led_netdev "lan" "LAN" "blue:lan" "eth0" "link tx rx"
+	;;
+esac
+
+board_config_flush
+
+exit 0

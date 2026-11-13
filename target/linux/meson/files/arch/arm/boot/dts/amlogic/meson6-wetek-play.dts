@@ -17,7 +17,9 @@
 /dts-v1/;
 #include <dt-bindings/clock/meson8b-clkc.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
 #include <dt-bindings/reset/amlogic,meson8b-reset.h>
+#include <dt-bindings/thermal/thermal.h>
 #include "meson6.dtsi"
 
 / {
@@ -39,18 +41,93 @@
 	cpus {
 		enable-method = "amlogic,meson6-smp";
 
-		cpu@200 {
+		cpu0: cpu@200 {
 			clocks = <&clkc CLKID_CPUCLK>;
 			operating-points-v2 = <&cpu_opp_table>;
 			clock-latency = <200000>;
 			cpu-supply = <&vcck>;
+			#cooling-cells = <2>; /* min followed by max */
 		};
 
-		cpu@201 {
+		cpu1: cpu@201 {
 			clocks = <&clkc CLKID_CPUCLK>;
 			operating-points-v2 = <&cpu_opp_table>;
 			clock-latency = <200000>;
 			cpu-supply = <&vcck>;
+			#cooling-cells = <2>; /* min followed by max */
+		};
+	};
+
+	/*
+	 * Diody na froncie (vendor: drivers/leds/leds-wetekplay.c): wifi na
+	 * GPIOC_8, eth na GPIOC_14, obie świecą stanem wysokim. Trzecia, power
+	 * (niebieska/czerwona), wisi na pinie TEST_n sterowanym z AO 0x24 bit 31
+	 * i rejestru w secbus - na razie zostaje tak, jak ustawił ją U-Boot.
+	 */
+	leds {
+		compatible = "gpio-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&led_pins>;
+
+		led-wlan {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_WLAN;
+			gpios = <&gpio_c 8 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-lan {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_LAN;
+			gpios = <&gpio_c 14 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+	};
+
+	/*
+	 * Czujnik to kanał temperatury SAR ADC bez kalibracji z efuse, więc
+	 * progi jak w meson8b.dtsi z zapasem: odczyt może odbiegać o kilka
+	 * stopni. Pod pełnym obciążeniem box ma ok. 64 °C.
+	 */
+	thermal-zones {
+		soc-thermal {
+			polling-delay-passive = <250>; /* milliseconds */
+			polling-delay = <1000>; /* milliseconds */
+			thermal-sensors = <&thermal_sensor>;
+
+			trips {
+				soc_passive: soc-passive {
+					temperature = <80000>; /* millicelsius */
+					hysteresis = <2000>; /* millicelsius */
+					type = "passive";
+				};
+
+				soc_hot: soc-hot {
+					temperature = <90000>; /* millicelsius */
+					hysteresis = <2000>; /* millicelsius */
+					type = "hot";
+				};
+
+				soc_critical: soc-critical {
+					temperature = <110000>; /* millicelsius */
+					hysteresis = <2000>; /* millicelsius */
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&soc_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map1 {
+					trip = <&soc_hot>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
 		};
 	};
 
@@ -226,6 +303,37 @@
 			pinctrl-single,bits = <0x20 0x0000003f 0x0000003f>,
 					      <0x0c 0x00200000 0x00200000>;
 		};
+
+		/*
+		 * Diody jako zwykłe GPIO: GPIOC_8 ma funkcje TCON_6_A (PIN_MUX_0
+		 * bit 18), TCON_VCOM (PIN_MUX_1 bit 10) i SPDIF_in (PIN_MUX_3
+		 * bit 23) - wszystkie wyłączone. GPIOC_14 nie ma innej funkcji.
+		 */
+		led_pins: led-pins {
+			pinctrl-single,bits = <0x00 0x00000000 0x00040000>,
+					      <0x04 0x00000000 0x00000400>,
+					      <0x0c 0x00000000 0x00800000>;
+		};
+	};
+};
+
+&aobus {
+	/*
+	 * AO_RTI_PIN_MUX_REG (vendor: rejestr pinmux nr 10). Tylko bit pilota;
+	 * bity UART_AO zostają, jak ustawił je U-Boot.
+	 */
+	pinmux_ao: pinmux@14 {
+		compatible = "pinctrl-single";
+		reg = <0x14 0x4>;
+		#pinctrl-cells = <2>;
+		pinctrl-single,bit-per-mux;
+		pinctrl-single,register-width = <32>;
+		pinctrl-single,function-mask = <0x1>;
+
+		/* odbiornik IR na GPIOAO_7: bit 0 (vendor: remote_pins) */
+		ir_pins: ir-pins {
+			pinctrl-single,bits = <0x0 0x00000001 0x00000001>;
+		};
 	};
 };
 
@@ -384,10 +492,26 @@
 
 /*
  * Jeszcze nie zrobione:
- *  - diody (power, wifi, eth) i pilot IR,
+ *  - dioda power (pin TEST_n, patrz węzeł leds),
  *  - NAND 0xc1108600: brak sterownika w mainline.
- * Zegar 32 kHz dla Wi-Fi (HHI_GEN_CLK_CNTL2) okazał się niepotrzebny.
  */
+
+/* Odbiornik pilota; dekodowanie protokołów robi rc-core w jądrze. */
+&ir_receiver {
+	pinctrl-names = "default";
+	pinctrl-0 = <&ir_pins>;
+	status = "okay";
+};
+
+/*
+ * efuse tylko do odczytu w /sys/bus/nvmem. meson6.dtsi wyłącza go, bo
+ * mainline nie miał dla Meson6 zegarów; bramkę daje meson6-clkc.
+ */
+&efuse {
+	clocks = <&clkc CLKID_EFUSE>;
+	clock-names = "core";
+	status = "okay";
+};
 
 /*
  * Przetwornik SAR ADC z czujnikiem temperatury SoC (łatka 0005,
