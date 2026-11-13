@@ -32,6 +32,7 @@
 		led-running = &led_power;
 		led-upgrade = &led_power;
 		serial0 = &uart_AO;
+		serial1 = &uart_A;
 		ethernet0 = &ethmac;
 		mmc0 = &sd_slot;
 		mmc1 = &wifi_slot;
@@ -310,6 +311,24 @@
 		gpio-controller;
 	};
 
+	/* PREG_PAD_GPIO4 (GPIOX_0..31): EN_N 0x2018, O 0x2019, I 0x201a */
+	gpio_x: gpio@8068 {
+		compatible = "wd,mbl-gpio";
+		reg = <0x8068 0x4>, <0x8064 0x4>, <0x8060 0x4>;
+		reg-names = "dat", "set", "dirin";
+		#gpio-cells = <2>;
+		gpio-controller;
+	};
+
+	/* PREG_PAD_GPIO6 (GPIOE_0..11, GPIOZ): EN_N 0x2008, O 0x2009, I 0x200a */
+	gpio_e: gpio@8028 {
+		compatible = "wd,mbl-gpio";
+		reg = <0x8028 0x4>, <0x8024 0x4>, <0x8020 0x4>;
+		reg-names = "dat", "set", "dirin";
+		#gpio-cells = <2>;
+		gpio-controller;
+	};
+
 	/* RESET0..7_REGISTER od 0x1101: ten sam układ co w Meson8b */
 	reset: reset-controller@4404 {
 		compatible = "amlogic,meson8b-reset";
@@ -344,6 +363,14 @@
 		sdio_a_pins: sdio-a-pins {
 			pinctrl-single,bits = <0x20 0x0000003f 0x0000003f>,
 					      <0x0c 0x00200000 0x00200000>;
+		};
+
+		/*
+		 * UART_A na GPIOX_13..16 (TX, RX, CTS, RTS) dla Bluetootha:
+		 * PIN_MUX_4 bity 13..10, piny nie mają innych funkcji.
+		 */
+		uart_a_pins: uart-a-pins {
+			pinctrl-single,bits = <0x10 0x00003c00 0x00003c00>;
 		};
 
 		/*
@@ -461,6 +488,35 @@
 /* Konsola na złączu RS-232; vendor: uart_ao, 115200 */
 &uart_AO {
 	status = "okay";
+};
+
+/*
+ * Bluetooth AP6210 (BCM20710) na UART_A, vendor: bt-dev z gpio_en = GPIOE_11
+ * (stan wysoki = włączony) i gpio_wake = GPIOX_10 (na stałe wysoki). Android
+ * ładuje BCM20702.hcd i pracuje na 2 Mb/s. Zegar 32 kHz z CLK_OUT3 dzieli
+ * z Wi-Fi. Bramka UART_A to CLKID_UART0, bez niej clk_disable_unused
+ * wyłączyłby port.
+ */
+&uart_A {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart_a_pins>;
+	clocks = <&xtal>, <&clkc CLKID_UART0>, <&clkc CLKID_CLK81>;
+	/*
+	 * Bez tego meson_uart kasuje CRTSCTS i zostaje w trybie dwóch
+	 * przewodów: RTS nie jest wystawiany, a moduł bez CTS nie odpowiada
+	 * (hci0: Reset failed -110, sprawdzone 2026-11-13).
+	 */
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth {
+		compatible = "brcm,bcm20702a1";
+		shutdown-gpios = <&gpio_e 11 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&gpio_x 10 GPIO_ACTIVE_HIGH>;
+		clocks = <&clkc 250>;
+		clock-names = "lpo";
+		max-speed = <2000000>;
+	};
 };
 
 /*
