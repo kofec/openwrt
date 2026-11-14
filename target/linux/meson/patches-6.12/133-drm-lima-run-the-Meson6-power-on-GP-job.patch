@@ -1,0 +1,180 @@
+From cbf1bdcd454a05d93c8d51237219e9b56c074f4e Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Sat, 14 Nov 2026 13:04:55 +0000
+Subject: [PATCH 133/134] drm/lima: run the Meson6 power-on GP job
+
+The vendor Mali driver for Meson6 (AML8726-MX, Mali-400 MP2 rev B,
+platform/meson_m400/mali_platform.c: mali_meson_poweron()) runs a tiny
+GP job through the GP MMU once after power-on before using the GPU.
+Without it every GP job hangs under lima (no GP interrupt, GP MMU page
+fault on the first job). Use the same command stream and register
+sequence, only for amlogic,meson6-mali.
+---
+ drivers/gpu/drm/lima/lima_device.c | 130 +++++++++++++++++++++++++++++
+ 1 file changed, 130 insertions(+)
+
+diff --git a/drivers/gpu/drm/lima/lima_device.c b/drivers/gpu/drm/lima/lima_device.c
+index 7c873e62c..6b492b81d 100644
+--- a/drivers/gpu/drm/lima/lima_device.c
++++ b/drivers/gpu/drm/lima/lima_device.c
+@@ -7,6 +7,9 @@
+ #include <linux/slab.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/platform_device.h>
++#include <linux/delay.h>
++#include <linux/of.h>
++#include <linux/sizes.h>
+ 
+ #include "lima_device.h"
+ #include "lima_gp.h"
+@@ -17,6 +20,7 @@
+ #include "lima_dlbu.h"
+ #include "lima_bcast.h"
+ #include "lima_vm.h"
++#include "lima_regs.h"
+ 
+ struct lima_ip_desc {
+ 	char *name;
+@@ -352,6 +356,130 @@ static void lima_fini_pp_pipe(struct lima_device *dev)
+ 	lima_sched_pipe_fini(pipe);
+ }
+ 
++/*
++ * Meson6 (AML8726-MX) Mali-400 MP2 rev B: the vendor driver runs a tiny GP
++ * job through the GP MMU once after power-on (mali_meson_poweron() in
++ * platform/meson_m400/mali_platform.c) before handing the GPU to the Mali
++ * driver. Without it every GP job hangs under lima. Same command stream,
++ * same register sequence; all 1024 PTEs point to the data page.
++ */
++static const u32 lima_meson6_poweron_data[] = {
++	0x00000040, 0x20400000, 0x00000300, 0x30040000,
++	0x00000400, 0x400a0000, 0x0f000033, 0x10000042,
++	0x00300c00, 0x10000040, 0x4c000001, 0x00000000,
++	0x00000000, 0x60000000, 0x00000000, 0x00000000,
++	0x00004000, 0x00002000, 0x00000210, 0x0000203f,
++	0x00000220, 0x0000203f, 0x00000230, 0x0000203f,
++	0x00000240, 0x0000203f, 0x00000250, 0x0000203f,
++	0x00000260, 0x0000203f, 0x00000270, 0x0000203f,
++	0x00000280, 0x0000203f, 0x00000290, 0x0000203f,
++	0x000002a0, 0x0000203f, 0x000002b0, 0x0000203f,
++	0x000002c0, 0x0000203f, 0x000002d0, 0x0000203f,
++	0x000002e0, 0x0000203f, 0x000002f0, 0x0000203f,
++	0x00002000, 0x00002000, 0x00002010, 0x0000203f,
++	0x00002020, 0x0000203f, 0x00002030, 0x0000203f,
++	0x00002040, 0x0000203f, 0x00002050, 0x0000203f,
++	0x00002060, 0x0000203f, 0x00002070, 0x0000203f,
++	0x00002080, 0x0000203f, 0x00002090, 0x0000203f,
++	0x000020a0, 0x0000203f, 0x000020b0, 0x0000203f,
++	0x000020c0, 0x0000203f, 0x000020d0, 0x0000203f,
++	0x000020e0, 0x0000203f, 0x000020f0, 0x0000203f,
++};
++
++static const u32 lima_meson6_poweron_const[] = {	/* at 0x300 */
++	0x3f2a6400, 0xbf317600, 0x3e8d8e00, 0x00000000,
++	0x3f2f7000, 0x3f36e200, 0x3e10c500, 0x00000000,
++	0xbe974e00, 0x3dc35300, 0x3f735800, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x3f800000,
++	0x42b00000, 0x42dc0000, 0x3f800000, 0x3f800000,
++	0x42b00000, 0x42dc0000,
++};
++
++static const u32 lima_meson6_poweron_inst[] = {	/* at 0x400 */
++	0xad4ad6b5, 0x438002b5, 0x0007ffe0, 0x00001e00,
++	0xad4ad694, 0x038002b5, 0x0087ffe0, 0x00005030,
++	0xad4bda56, 0x038002b5, 0x0007ffe0, 0x00001c10,
++	0xad4ad6b5, 0x038002b5, 0x4007fee0, 0x00001c00,
++};
++
++#define M6_GP(r)	(ldev->iomem + 0x0000 + (r))
++#define M6_GPMMU(r)	(ldev->iomem + 0x3000 + (r))
++#define M6_PPMMU0(r)	(ldev->iomem + 0x4000 + (r))
++
++static void lima_meson6_poweron(struct lima_device *ldev)
++{
++	dma_addr_t dma;
++	u32 *buf, *dte, *pte, *data, mask, raw, st;
++	int i;
++
++	if (!of_device_is_compatible(ldev->dev->of_node, "amlogic,meson6-mali"))
++		return;
++
++	dev_info(ldev->dev, "meson6 poweron: pp version %08x, gpmmu dte %08x\n",
++		 readl(ldev->iomem + 0x9000), readl(M6_GPMMU(0x00)));
++	if (readl(M6_GPMMU(0x00))) {
++		dev_info(ldev->dev, "meson6 poweron: GP MMU in use, skipped\n");
++		return;
++	}
++
++	buf = dma_alloc_wc(ldev->dev, 3 * SZ_4K, &dma, GFP_KERNEL | __GFP_ZERO);
++	if (!buf) {
++		dev_err(ldev->dev, "meson6 poweron: no memory\n");
++		return;
++	}
++	dte = buf;
++	pte = buf + SZ_4K / 4;
++	data = buf + 2 * SZ_4K / 4;
++
++	dte[0] = (dma + SZ_4K) | 0x01;
++	for (i = 0; i < 1024; i++)
++		pte[i] = (dma + 2 * SZ_4K) | 0x01 | 0x02;
++	memcpy(data, lima_meson6_poweron_data, sizeof(lima_meson6_poweron_data));
++	memcpy(data + 0x300 / 4, lima_meson6_poweron_const,
++	       sizeof(lima_meson6_poweron_const));
++	memcpy(data + 0x400 / 4, lima_meson6_poweron_inst,
++	       sizeof(lima_meson6_poweron_inst));
++	wmb();
++
++	writel(dma, M6_GPMMU(0x00));		/* DTE_ADDR */
++	writel(0, M6_GPMMU(0x08));		/* CMD: enable paging */
++	st = readl(M6_GPMMU(0x04));
++
++	writel(0, M6_GP(LIMA_GP_VSCL_START_ADDR));
++	writel(0x38, M6_GP(LIMA_GP_VSCL_END_ADDR));
++
++	mask = readl(M6_GP(LIMA_GP_INT_MASK));
++	writel(0x707bff, M6_GP(LIMA_GP_INT_CLEAR));
++	writel(0, M6_GP(LIMA_GP_INT_MASK));
++
++	writel(LIMA_GP_CMD_START_VS, M6_GP(LIMA_GP_CMD));
++	mdelay(50);
++
++	raw = readl(M6_GP(LIMA_GP_INT_RAWSTAT));
++	dev_info(ldev->dev,
++		 "meson6 poweron: mmu status %08x, gp rawstat %08x status %08x, mmu rawstat %08x\n",
++		 st, raw, readl(M6_GP(LIMA_GP_STATUS)), readl(M6_GPMMU(0x14)));
++
++	writel(LIMA_GP_CMD_RESET, M6_GP(LIMA_GP_CMD));	/* force reset GP */
++	writel(1, M6_GPMMU(0x08));			/* disable paging */
++	writel(6, M6_GPMMU(0x08));			/* soft reset */
++	mdelay(50);
++
++	writel(0x3ff, M6_GP(LIMA_GP_INT_CLEAR));
++	writel(0xffffffff, M6_GPMMU(0x18));
++	writel(0, M6_GPMMU(0x1c));
++	/* the vendor writes these to the PP0 MMU (typo in its register list) */
++	writel(0xffffffff, M6_PPMMU0(0x18));
++	writel(0, M6_PPMMU0(0x1c));
++	writel(0x707bff, M6_GP(LIMA_GP_INT_CLEAR));
++	writel(mask, M6_GP(LIMA_GP_INT_MASK));
++
++	dev_info(ldev->dev, "meson6 poweron: done, gpmmu dte %08x status %08x\n",
++		 readl(M6_GPMMU(0x00)), readl(M6_GPMMU(0x04)));
++
++	dma_free_wc(ldev->dev, 3 * SZ_4K, buf, dma);
++}
++
+ int lima_device_init(struct lima_device *ldev)
+ {
+ 	struct platform_device *pdev = to_platform_device(ldev->dev);
+@@ -394,6 +522,8 @@ int lima_device_init(struct lima_device *ldev)
+ 		goto err_out3;
+ 	}
+ 
++	lima_meson6_poweron(ldev);
++
+ 	for (i = 0; i < lima_ip_num; i++) {
+ 		err = lima_init_ip(ldev, i);
+ 		if (err)
+-- 
+2.53.0
+

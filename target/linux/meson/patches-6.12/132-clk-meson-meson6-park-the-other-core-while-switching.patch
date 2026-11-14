@@ -1,0 +1,137 @@
+From f08b0181cd62a70db4d95e3b241cd5938dda8098 Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Sat, 14 Nov 2026 13:04:55 +0000
+Subject: [PATCH 132/134] clk: meson: meson6: park the other core while
+ switching the CPU clock
+
+The vendor kernel changes the CPU clock from an IPI on the other core
+(clk_set_rate_a9() -> smp_call_function(..., wait = 1)), so no core
+touches memory while the CPU clock is switched between the crystal and
+the system PLL. Without that the WeTek Play locks up hard (no message,
+watchdog reset) as soon as cpufreq changes the CPU rate while the Mali
+GPU is busy; a shorter time on the crystal with interrupts off and a
+fixed system PLL (post dividers only) did not help.
+
+Park the other core in a spin loop with interrupts off from
+PRE_RATE_CHANGE until POST_RATE_CHANGE and switch bit 7 of
+HHI_SYS_CPU_CLK_CNTL directly: clk_hw_set_parent() would propagate the
+rate change to the TWD, whose notifier waits for the parked core.
+---
+ drivers/clk/meson/meson6.c | 81 ++++++++++++++++++++++++++++++--------
+ 1 file changed, 65 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/clk/meson/meson6.c b/drivers/clk/meson/meson6.c
+index 64ce474aa..197ac90f8 100644
+--- a/drivers/clk/meson/meson6.c
++++ b/drivers/clk/meson/meson6.c
+@@ -21,6 +21,8 @@
+ #include <linux/regmap.h>
+ #include <linux/reset-controller.h>
+ #include <linux/slab.h>
++#include <linux/smp.h>
++#include <linux/atomic.h>
+ 
+ #include "clk-regmap.h"
+ #include "clk-mpll.h"
+@@ -444,35 +446,82 @@ static struct clk_fixed_factor meson6_periph_clk = {
+ /*
+  * Like on Meson8b the CPU is parked on the crystal while the post divider
+  * mux or the system PLL behind it is changed, the vendor kernel does the same.
++ *
++ * The vendor kernel changes the CPU clock from an IPI on the other core
++ * (clk_set_rate_a9() -> smp_call_function(..., wait = 1)), so neither core
++ * touches memory while the CPU clock (and with it the L2 and the A9 AXI
++ * side) is switched. Without that the WeTek Play locks up as soon as the
++ * CPU rate changes while the Mali GPU is busy. Do the same: park the other
++ * core in a spin loop with interrupts off from PRE_RATE_CHANGE until
++ * POST_RATE_CHANGE, and keep the interrupts off here as well.
+  */
++static atomic_t meson6_cpu_parked;
++static atomic_t meson6_cpu_release;
++static unsigned long meson6_cpu_clk_irqflags;
++static bool meson6_cpu_clk_parked;
++
++static void meson6_cpu_park_other(void *unused)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	atomic_inc(&meson6_cpu_parked);
++	while (!atomic_read(&meson6_cpu_release))
++		cpu_relax();
++	atomic_dec(&meson6_cpu_parked);
++	local_irq_restore(flags);
++}
++
+ static int meson6_cpu_clk_notifier_cb(struct notifier_block *nb,
+ 				      unsigned long event, void *data)
+ {
+-	struct clk_hw *parent_clk;
+-	int ret;
++	int others, ret;
+ 
+ 	switch (event) {
+ 	case PRE_RATE_CHANGE:
+-		/* xtal */
+-		parent_clk = clk_hw_get_parent_by_index(&meson6_cpu_clk.hw, 0);
+-		break;
++		preempt_disable();
++		others = num_online_cpus() - 1;
++		atomic_set(&meson6_cpu_release, 0);
++		if (others > 0) {
++			smp_call_function(meson6_cpu_park_other, NULL, 0);
++			while (atomic_read(&meson6_cpu_parked) < others)
++				cpu_relax();
++		}
++		local_irq_save(meson6_cpu_clk_irqflags);
++		meson6_cpu_clk_parked = true;
++		/*
++		 * Write the mux directly: clk_hw_set_parent() would notify
++		 * the TWD, which then waits for the parked core (on_each_cpu).
++		 */
++		ret = regmap_update_bits(meson6_cpu_clk.map,
++					 HHI_SYS_CPU_CLK_CNTL, BIT(7), 0);
++		if (ret) {
++			meson6_cpu_clk_parked = false;
++			atomic_set(&meson6_cpu_release, 1);
++			local_irq_restore(meson6_cpu_clk_irqflags);
++			preempt_enable();
++			return notifier_from_errno(ret);
++		}
++		return NOTIFY_OK;
+ 
+ 	case POST_RATE_CHANGE:
+-		/* cpu_scale_out_sel */
+-		parent_clk = clk_hw_get_parent_by_index(&meson6_cpu_clk.hw, 1);
+-		break;
++	case ABORT_RATE_CHANGE:
++		if (!meson6_cpu_clk_parked)
++			return NOTIFY_DONE;
++		ret = regmap_update_bits(meson6_cpu_clk.map,
++					 HHI_SYS_CPU_CLK_CNTL, BIT(7), BIT(7));
++		udelay(100);
++		meson6_cpu_clk_parked = false;
++		atomic_set(&meson6_cpu_release, 1);
++		local_irq_restore(meson6_cpu_clk_irqflags);
++		while (atomic_read(&meson6_cpu_parked))
++			cpu_relax();
++		preempt_enable();
++		return ret ? notifier_from_errno(ret) : NOTIFY_OK;
+ 
+ 	default:
+ 		return NOTIFY_DONE;
+ 	}
+-
+-	ret = clk_hw_set_parent(&meson6_cpu_clk.hw, parent_clk);
+-	if (ret)
+-		return notifier_from_errno(ret);
+-
+-	udelay(100);
+-
+-	return NOTIFY_OK;
+ }
+ 
+ static struct notifier_block meson6_cpu_clk_nb = {
+-- 
+2.53.0
+

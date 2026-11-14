@@ -916,6 +916,36 @@
 };
 
 /*
+ * Mali-400 MP2 (vendor: platform/meson_m400/platform_mx.c, the same layout
+ * in /proc/iomem under Android): GP, L2, GP MMU, PP0/PP1 MMU, PP0, PP1, no
+ * PMU. The PP MMU interrupts do not reach the GIC on Meson6 rev B: the vendor
+ * driver polls the PP MMU status every 10 ms and fires timer C (SPI 6) as a
+ * one-shot to emulate them. Mainline only uses timer A, so SPI 6 is given to
+ * both PP MMUs here (shared); it never fires, a PP page fault ends in the
+ * job timeout instead.
+ */
+&{/soc} {
+	gpu: gpu@d0060000 {
+		compatible = "amlogic,meson6-mali", "arm,mali-400";
+		reg = <0xd0060000 0x10000>;
+		interrupts = <GIC_SPI 48 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 6 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 51 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 6 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "gp", "gpmmu", "pp0", "ppmmu0", "pp1",
+				  "ppmmu1";
+		clocks = <&clkc CLKID_CLK81>, <&clkc CLKID_MALI>;
+		clock-names = "bus", "core";
+		assigned-clocks = <&clkc CLKID_MALI_0_SEL>,
+				  <&clkc CLKID_MALI>;
+		assigned-clock-parents = <&clkc CLKID_FCLK_DIV3>, <0>;
+		assigned-clock-rates = <0>, <333333333>;
+	};
+};
+
+/*
  * AIU like on Meson8, with the Meson6 clocks (no separate S/PDIF master
  * clock). No FIFO interrupts on Meson6 (the vendor kernel polls with a timer,
  * nothing shows up in the GIC during playback): the driver polls as well.

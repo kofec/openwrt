@@ -1,0 +1,180 @@
+From 2ee22e2df4f9f48f2e288bb4dfefd48f875dd535 Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Sat, 14 Nov 2026 13:04:55 +0000
+Subject: [PATCH 134/134] drm/lima: poll the PP MMUs on Meson6
+
+On Meson6 rev B the PP MMU interrupts do not reach the GIC; the vendor
+driver polls the PP MMU status every 10 ms and fires a timer interrupt
+to emulate them (platform/meson_m400/mali_fix.c). Poll them while a PP
+task runs, when the Mali clock is known to be on, and call the regular
+MMU interrupt handler. The interrupt lines in the DT point to the unused
+timer C interrupt (SPI 6).
+---
+ drivers/gpu/drm/lima/lima_mmu.c |  9 +++++
+ drivers/gpu/drm/lima/lima_mmu.h |  3 ++
+ drivers/gpu/drm/lima/lima_pp.c  | 72 +++++++++++++++++++++++++++++++++
+ 3 files changed, 84 insertions(+)
+
+diff --git a/drivers/gpu/drm/lima/lima_mmu.c b/drivers/gpu/drm/lima/lima_mmu.c
+index 6611e2836..87aa208a5 100644
+--- a/drivers/gpu/drm/lima/lima_mmu.c
++++ b/drivers/gpu/drm/lima/lima_mmu.c
+@@ -59,6 +59,15 @@ static irqreturn_t lima_mmu_irq_handler(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * Meson6: the PP MMU interrupt lines do not reach the GIC, the PP pipe polls
++ * them while a PP task runs (see lima_pp.c).
++ */
++irqreturn_t lima_mmu_poll(struct lima_ip *ip)
++{
++	return lima_mmu_irq_handler(ip->irq, ip);
++}
++
+ static int lima_mmu_hw_init(struct lima_ip *ip)
+ {
+ 	struct lima_device *dev = ip->dev;
+diff --git a/drivers/gpu/drm/lima/lima_mmu.h b/drivers/gpu/drm/lima/lima_mmu.h
+index f0c97ac75..1e4c8b099 100644
+--- a/drivers/gpu/drm/lima/lima_mmu.h
++++ b/drivers/gpu/drm/lima/lima_mmu.h
+@@ -4,6 +4,8 @@
+ #ifndef __LIMA_MMU_H__
+ #define __LIMA_MMU_H__
+ 
++#include <linux/interrupt.h>
++
+ struct lima_ip;
+ struct lima_vm;
+ 
+@@ -15,5 +17,6 @@ void lima_mmu_fini(struct lima_ip *ip);
+ void lima_mmu_flush_tlb(struct lima_ip *ip);
+ void lima_mmu_switch_vm(struct lima_ip *ip, struct lima_vm *vm);
+ void lima_mmu_page_fault_resume(struct lima_ip *ip);
++irqreturn_t lima_mmu_poll(struct lima_ip *ip);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/lima/lima_pp.c b/drivers/gpu/drm/lima/lima_pp.c
+index eaab4788d..20517977e 100644
+--- a/drivers/gpu/drm/lima/lima_pp.c
++++ b/drivers/gpu/drm/lima/lima_pp.c
+@@ -5,6 +5,8 @@
+ #include <linux/io.h>
+ #include <linux/device.h>
+ #include <linux/slab.h>
++#include <linux/of.h>
++#include <linux/timer.h>
+ 
+ #include <drm/lima_drm.h>
+ 
+@@ -14,6 +16,58 @@
+ #include "lima_bcast.h"
+ #include "lima_vm.h"
+ #include "lima_regs.h"
++#include "lima_mmu.h"
++
++/*
++ * Meson6 (AML8726-MX) rev B: the PP MMU interrupts do not reach the GIC. The
++ * vendor driver polls the PP MMU status every 10 ms (malifix). Do the same,
++ * but only while a PP task runs, when the Mali clock is known to be on.
++ */
++static struct timer_list lima_m6_ppmmu_timer;
++static struct lima_sched_pipe *lima_m6_ppmmu_pipe;
++static bool lima_m6_ppmmu_on;
++
++static void lima_m6_ppmmu_poll(struct timer_list *t)
++{
++	struct lima_sched_pipe *pipe = lima_m6_ppmmu_pipe;
++	int i;
++
++	if (!READ_ONCE(lima_m6_ppmmu_on))
++		return;
++
++	for (i = 0; i < pipe->num_mmu; i++) {
++		struct lima_ip *mmu = pipe->mmu[i];
++		unsigned long flags;
++
++		if (!readl(mmu->iomem + LIMA_MMU_INT_STATUS))
++			continue;
++		dev_warn_once(mmu->dev->dev, "meson6: %s interrupt caught by polling\n",
++			      lima_ip_name(mmu));
++		local_irq_save(flags);
++		lima_mmu_poll(mmu);
++		local_irq_restore(flags);
++	}
++
++	if (READ_ONCE(lima_m6_ppmmu_on))
++		mod_timer(&lima_m6_ppmmu_timer, jiffies + msecs_to_jiffies(10));
++}
++
++static void lima_m6_ppmmu_start(struct lima_sched_pipe *pipe)
++{
++	if (lima_m6_ppmmu_pipe != pipe)
++		return;
++	WRITE_ONCE(lima_m6_ppmmu_on, true);
++	mod_timer(&lima_m6_ppmmu_timer, jiffies + msecs_to_jiffies(10));
++}
++
++static void lima_m6_ppmmu_stop(struct lima_sched_pipe *pipe)
++{
++	if (lima_m6_ppmmu_pipe != pipe)
++		return;
++	WRITE_ONCE(lima_m6_ppmmu_on, false);
++	/* may be called from the PP interrupt handler */
++	timer_delete(&lima_m6_ppmmu_timer);
++}
+ 
+ #define pp_write(reg, data) writel(data, ip->iomem + reg)
+ #define pp_read(reg) readl(ip->iomem + reg)
+@@ -406,10 +460,14 @@ static void lima_pp_task_run(struct lima_sched_pipe *pipe,
+ 			pp_write(LIMA_PP_CTRL, LIMA_PP_CTRL_START_RENDERING);
+ 		}
+ 	}
++
++	lima_m6_ppmmu_start(pipe);
+ }
+ 
+ static void lima_pp_task_fini(struct lima_sched_pipe *pipe)
+ {
++	lima_m6_ppmmu_stop(pipe);
++
+ 	if (pipe->bcast_processor)
+ 		lima_pp_soft_reset_async(pipe->bcast_processor);
+ 	else {
+@@ -424,6 +482,8 @@ static void lima_pp_task_error(struct lima_sched_pipe *pipe)
+ {
+ 	int i;
+ 
++	lima_m6_ppmmu_stop(pipe);
++
+ 	for (i = 0; i < pipe->num_processor; i++) {
+ 		struct lima_ip *ip = pipe->processor[i];
+ 
+@@ -491,11 +551,23 @@ int lima_pp_pipe_init(struct lima_device *dev)
+ 	pipe->task_mmu_error = lima_pp_task_mmu_error;
+ 	pipe->task_mask_irq = lima_pp_task_mask_irq;
+ 
++	if (of_device_is_compatible(dev->dev->of_node, "amlogic,meson6-mali")) {
++		lima_m6_ppmmu_pipe = pipe;
++		timer_setup(&lima_m6_ppmmu_timer, lima_m6_ppmmu_poll, 0);
++		dev_info(dev->dev, "meson6: polling the PP MMUs\n");
++	}
++
+ 	return 0;
+ }
+ 
+ void lima_pp_pipe_fini(struct lima_device *dev)
+ {
++	if (lima_m6_ppmmu_pipe == dev->pipe + lima_pipe_pp) {
++		WRITE_ONCE(lima_m6_ppmmu_on, false);
++		timer_delete_sync(&lima_m6_ppmmu_timer);
++		lima_m6_ppmmu_pipe = NULL;
++	}
++
+ 	if (!--lima_pp_task_slab_refcnt) {
+ 		kmem_cache_destroy(lima_pp_task_slab);
+ 		lima_pp_task_slab = NULL;
+-- 
+2.53.0
+
