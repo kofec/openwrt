@@ -1,0 +1,242 @@
+From 9e0ada4f10b30dc31c5dc1d8dbd7cd526c35cc10 Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Sat, 14 Nov 2026 15:37:55 +0000
+Subject: [PATCH 137/137] media: meson: vdec: swap the Meson6 pictures through
+ private buffers
+
+The Meson6 canvases have no endianness control (bits 26..29 of the LUT,
+the GX endianness field, are accepted but ignored), so the decoded
+pictures land in memory with the bytes of each 64-bit word reversed.
+Swapping the vb2 buffer in place corrupts the reference pictures the
+decoder still predicts from. Decode into private picture planes instead
+and copy them byte swapped (NEON vrev64.8) into the vb2 buffer on
+output: about 8 ms for a 576p picture on the WeTek Play.
+---
+ drivers/staging/media/meson/vdec/vdec.c       |   1 +
+ drivers/staging/media/meson/vdec/vdec.h       |  10 ++
+ .../staging/media/meson/vdec/vdec_helpers.c   | 127 +++++++++++++++++-
+ .../staging/media/meson/vdec/vdec_helpers.h   |   2 +
+ 4 files changed, 136 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index be2a275c4..696bf9dc1 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -380,6 +380,7 @@ static void vdec_free_canvas(struct amvdec_session *sess)
+ 		meson_canvas_free(sess->core->canvas, sess->canvas_alloc[i]);
+ 
+ 	sess->canvas_num = 0;
++	amvdec_m6_free_pics(sess);
+ }
+ 
+ static void vdec_reset_timestamps(struct amvdec_session *sess)
+diff --git a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+index 258685177..446be68d3 100644
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -278,6 +278,16 @@ struct amvdec_session {
+ 	u32 wrap_count;
+ 	u32 fw_idx_to_vb2_idx[32];
+ 
++	/*
++	 * Meson6: decoder-private picture planes per vb2 buffer index. The
++	 * canvases point here; the planes are copied byte swapped into the
++	 * vb2 buffer on output since the decoder still uses them as
++	 * references.
++	 */
++	void *m6_vaddr[VB2_MAX_FRAME][3];
++	dma_addr_t m6_paddr[VB2_MAX_FRAME][3];
++	size_t m6_size[VB2_MAX_FRAME][3];
++
+ 	enum amvdec_status status;
+ 	void *priv;
+ };
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+index dc944b767..eb3818a86 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -5,6 +5,12 @@
+  */
+ 
+ #include <linux/gcd.h>
++#include <linux/ktime.h>
++#include <linux/swab.h>
++#ifdef CONFIG_KERNEL_MODE_NEON
++#include <asm/neon.h>
++#include <asm/simd.h>
++#endif
+ #include <media/v4l2-mem2mem.h>
+ #include <media/v4l2-event.h>
+ #include <media/videobuf2-dma-contig.h>
+@@ -77,6 +83,9 @@ u32 amvdec_am21c_size(u32 width, u32 height)
+ }
+ EXPORT_SYMBOL_GPL(amvdec_am21c_size);
+ 
++static dma_addr_t amvdec_pic_paddr(struct amvdec_session *sess,
++				   struct vb2_buffer *vb, unsigned int plane);
++
+ static int canvas_alloc(struct amvdec_session *sess, u8 *canvas_id)
+ {
+ 	int ret;
+@@ -108,8 +117,9 @@ static int set_canvas_yuv420m(struct amvdec_session *sess,
+ 		if (ret)
+ 			return ret;
+ 
+-		buf_paddr[i] =
+-		    vb2_dma_contig_plane_dma_addr(vb, i);
++		buf_paddr[i] = amvdec_pic_paddr(sess, vb, i);
++		if (!buf_paddr[i])
++			return -ENOMEM;
+ 	}
+ 
+ 	/* Y plane */
+@@ -152,8 +162,9 @@ static int set_canvas_nv12m(struct amvdec_session *sess,
+ 		if (ret)
+ 			return ret;
+ 
+-		buf_paddr[i] =
+-		    vb2_dma_contig_plane_dma_addr(vb, i);
++		buf_paddr[i] = amvdec_pic_paddr(sess, vb, i);
++		if (!buf_paddr[i])
++			return -ENOMEM;
+ 	}
+ 
+ 	/* Y plane */
+@@ -270,6 +281,112 @@ void amvdec_remove_ts(struct amvdec_session *sess, u64 ts)
+ }
+ EXPORT_SYMBOL_GPL(amvdec_remove_ts);
+ 
++/*
++ * Meson6: decoder-private picture planes (see struct amvdec_session).
++ */
++static dma_addr_t amvdec_pic_paddr(struct amvdec_session *sess,
++				   struct vb2_buffer *vb, unsigned int plane)
++{
++	struct device *dev = sess->core->dev;
++	unsigned int idx = vb->index;
++	size_t size = vb2_plane_size(vb, plane);
++
++	if (!sess->core->platform->meson6)
++		return vb2_dma_contig_plane_dma_addr(vb, plane);
++
++	if (sess->m6_vaddr[idx][plane] && sess->m6_size[idx][plane] != size) {
++		dma_free_coherent(dev, sess->m6_size[idx][plane],
++				  sess->m6_vaddr[idx][plane],
++				  sess->m6_paddr[idx][plane]);
++		sess->m6_vaddr[idx][plane] = NULL;
++	}
++
++	if (!sess->m6_vaddr[idx][plane]) {
++		sess->m6_vaddr[idx][plane] =
++			dma_alloc_coherent(dev, size,
++					   &sess->m6_paddr[idx][plane],
++					   GFP_KERNEL);
++		if (!sess->m6_vaddr[idx][plane])
++			return 0;
++		sess->m6_size[idx][plane] = size;
++	}
++
++	return sess->m6_paddr[idx][plane];
++}
++
++void amvdec_m6_free_pics(struct amvdec_session *sess)
++{
++	unsigned int i, p;
++
++	for (i = 0; i < VB2_MAX_FRAME; i++)
++		for (p = 0; p < 3; p++) {
++			if (!sess->m6_vaddr[i][p])
++				continue;
++			dma_free_coherent(sess->core->dev, sess->m6_size[i][p],
++					  sess->m6_vaddr[i][p],
++					  sess->m6_paddr[i][p]);
++			sess->m6_vaddr[i][p] = NULL;
++		}
++}
++EXPORT_SYMBOL_GPL(amvdec_m6_free_pics);
++
++/*
++ * Meson6: the canvases have no endianness control (bits 26..29 of the LUT,
++ * the GX endianness field, are accepted but ignored), so the decoded
++ * pictures land in memory with the bytes of each 64-bit word reversed.
++ * Copy them byte swapped from the private planes into the vb2 buffer. The
++ * plane sizes are multiples of 32 bytes (32-aligned width and height).
++ */
++static void meson6_copy_swap64(void *dst, const void *src, size_t len)
++{
++	const u64 *s = src;
++	u64 *d = dst;
++	size_t i;
++
++#ifdef CONFIG_KERNEL_MODE_NEON
++	if (may_use_simd() && !(len & 31)) {
++		kernel_neon_begin();
++		asm volatile(
++			"	.fpu	neon\n"
++			"1:	vld1.64		{d0-d3}, [%[s]]!\n"
++			"	vrev64.8	q0, q0\n"
++			"	vrev64.8	q1, q1\n"
++			"	vst1.64		{d0-d3}, [%[d]]!\n"
++			"	subs		%[n], %[n], #32\n"
++			"	bgt		1b\n"
++			: [d] "+r" (dst), [s] "+r" (src), [n] "+r" (len)
++			:
++			: "d0", "d1", "d2", "d3", "cc", "memory");
++		kernel_neon_end();
++		return;
++	}
++#endif
++	for (i = 0; i < len / 8; i++)
++		d[i] = swab64(s[i]);
++}
++
++static void meson6_copy_planes(struct amvdec_session *sess,
++			       struct vb2_v4l2_buffer *vbuf)
++{
++	struct vb2_buffer *vb = &vbuf->vb2_buf;
++	ktime_t t0 = ktime_get();
++	unsigned int i;
++
++	for (i = 0; i < vb->num_planes && i < 3; i++) {
++		void *dst = vb2_plane_vaddr(vb, i);
++		void *src = sess->m6_vaddr[vb->index][i];
++
++		if (dst && src)
++			meson6_copy_swap64(dst, src,
++					   vb2_get_plane_payload(vb, i));
++	}
++
++	if (vbuf->sequence == 0)
++		dev_info(sess->core->dev,
++			 "meson6: swapped copy of the first picture took %lld us\n",
++			 ktime_us_delta(ktime_get(), t0));
++}
++
+ static void dst_buf_done(struct amvdec_session *sess,
+ 			 struct vb2_v4l2_buffer *vbuf,
+ 			 u32 field, u64 timestamp,
+@@ -314,6 +431,8 @@ static void dst_buf_done(struct amvdec_session *sess,
+ 	dev_dbg(dev, "Buffer %u done, ts = %llu, flags = %08X\n",
+ 		vbuf->vb2_buf.index, timestamp, flags);
+ 	vbuf->field = field;
++	if (sess->core->platform->meson6)
++		meson6_copy_planes(sess, vbuf);
+ 	v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_DONE);
+ 
+ 	/* Buffer done probably means the vififo got freed */
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.h b/drivers/staging/media/meson/vdec/vdec_helpers.h
+index 4bf3e61d0..e6bec8026 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.h
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.h
+@@ -16,6 +16,8 @@
+  * @reg_base: Registry bases of where to write the canvas indexes
+  * @reg_num: number of contiguous registers after each reg_base (including it)
+  */
++void amvdec_m6_free_pics(struct amvdec_session *sess);
++
+ int amvdec_set_canvases(struct amvdec_session *sess,
+ 			u32 reg_base[], u32 reg_num[]);
+ 
+-- 
+2.53.0
+

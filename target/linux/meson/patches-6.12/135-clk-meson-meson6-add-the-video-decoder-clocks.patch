@@ -1,0 +1,125 @@
+From 12cbdc8c9864ccaaa68ce57712ac480626674d97 Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Sat, 14 Nov 2026 15:37:55 +0000
+Subject: [PATCH 135/137] clk: meson: meson6: add the video decoder clocks
+
+The DOS and DOS parser gates like on Meson8b and the VDEC_1 clock in
+HHI_VDEC_CLK_CNTL (vendor: amports/m6/vdec_clk.c, mod_gate.c MOD_VDEC),
+laid out like the Mali clock: source in bits 11..9 (fclk_div2, fclk_div3,
+fclk_div5), divider in bits 6..0, gate in bit 8.
+---
+ drivers/clk/meson/meson6.c | 77 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 77 insertions(+)
+
+diff --git a/drivers/clk/meson/meson6.c b/drivers/clk/meson/meson6.c
+index 197ac90f8..843e865b7 100644
+--- a/drivers/clk/meson/meson6.c
++++ b/drivers/clk/meson/meson6.c
+@@ -59,6 +59,7 @@
+ #define HHI_MPLL_CNTL			0x280
+ #define HHI_GEN_CLK_CNTL2		0x22c
+ #define HHI_MALI_CLK_CNTL		0x1b0
++#define HHI_VDEC_CLK_CNTL		0x1b4
+ 
+ /* not part of the Meson8b binding: clock output 3 (32kHz for Wi-Fi modules) */
+ #define MESON6_CLKID_CLK_OUT3		250
+@@ -1831,6 +1832,71 @@ static struct clk_regmap meson6_mali_0 = {
+ 	},
+ };
+ 
++/*
++ * Video decoder (vendor: drivers/amlogic/amports/m6/vdec_clk.c and
++ * mach-meson6/mod_gate.c, MOD_VDEC): the DOS and DOS parser gates like on
++ * Meson8b and the VDEC_1 clock in HHI_VDEC_CLK_CNTL, laid out like the Mali
++ * clock: source in bits 11..9 (5 = fclk_div2, 6 = fclk_div3, 7 = fclk_div5),
++ * divider in bits 6..0, gate in bit 8. The vendor kernel runs it at 200 MHz
++ * (fclk_div2 / 5), 250 MHz at most.
++ */
++static MESON6_GATE(meson6_dos, HHI_GCLK_MPEG0, 1);
++static MESON6_GATE(meson6_dos_parser, HHI_GCLK_MPEG1, 25);
++
++static u32 meson6_vdec_1_mux_table[] = { 5, 6, 7 };
++
++static struct clk_regmap meson6_vdec_1_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_VDEC_CLK_CNTL,
++		.mask = 0x7,
++		.shift = 9,
++		.table = meson6_vdec_1_mux_table,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vdec_1_sel",
++		.ops = &clk_regmap_mux_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_fclk_div2.hw,
++			&meson6_fclk_div3.hw,
++			&meson6_fclk_div5.hw,
++		},
++		.num_parents = 3,
++	},
++};
++
++static struct clk_regmap meson6_vdec_1_div = {
++	.data = &(struct clk_regmap_div_data){
++		.offset = HHI_VDEC_CLK_CNTL,
++		.shift = 0,
++		.width = 7,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vdec_1_div",
++		.ops = &clk_regmap_divider_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vdec_1_sel.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_vdec_1 = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_VDEC_CLK_CNTL,
++		.bit_idx = 8,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "vdec_1",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_vdec_1_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
+ /* clocks which are not exposed through the DT binding, parents first */
+ static struct clk_hw *meson6_internal_hws[] = {
+ 	&meson6_fixed_pll_dco.hw,
+@@ -1891,6 +1957,12 @@ static struct clk_hw *meson6_hw_clks[] = {
+ 	[CLKID_MALI_0_DIV]		= &meson6_mali_0_div.hw,
+ 	[CLKID_MALI_0]			= &meson6_mali_0.hw,
+ 	[CLKID_MALI]			= &meson6_mali_0.hw,
++	[CLKID_DOS]			= &meson6_dos.hw,
++	[CLKID_DOS_PARSER]		= &meson6_dos_parser.hw,
++	[CLKID_VDEC_1_SEL]		= &meson6_vdec_1_sel.hw,
++	[CLKID_VDEC_1_1_DIV]		= &meson6_vdec_1_div.hw,
++	[CLKID_VDEC_1_1]		= &meson6_vdec_1.hw,
++	[CLKID_VDEC_1]			= &meson6_vdec_1.hw,
+ 	[CLKID_HDMI_PLL_DCO] = &meson6_hdmi_pll_dco.hw,
+ 	[CLKID_HDMI_PLL_LVDS_OUT] = &meson6_hdmi_pll_lvds_out.hw,
+ 	[CLKID_HDMI_PLL_HDMI_OUT] = &meson6_hdmi_pll_hdmi_out.hw,
+@@ -2028,6 +2100,11 @@ static struct clk_regmap *const meson6_clk_regmaps[] = {
+ 	&meson6_mali_0_sel,
+ 	&meson6_mali_0_div,
+ 	&meson6_mali_0,
++	&meson6_dos,
++	&meson6_dos_parser,
++	&meson6_vdec_1_sel,
++	&meson6_vdec_1_div,
++	&meson6_vdec_1,
+ };
+ 
+ static struct meson_clk_hw_data meson6_clk_hw_data = {
+-- 
+2.53.0
+

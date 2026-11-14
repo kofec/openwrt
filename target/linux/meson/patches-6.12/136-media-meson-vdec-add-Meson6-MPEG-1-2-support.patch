@@ -1,0 +1,295 @@
+From 77c994d675520d1b01cc5c717c3e9c01e6d7212d Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Sat, 14 Nov 2026 15:37:55 +0000
+Subject: [PATCH 136/137] media: meson: vdec: add Meson6 MPEG-1/2 support
+
+The Meson6 (AML8726-MX) video decoder is a VDEC_1 like on GX: the DOS
+and ES parser registers used by this driver have the same offsets, the
+DOS block is at 0xc8010000 and the parser and interrupts are as on GXBB.
+There is no VDEC power domain in the AO block and no VDEC memory
+power-down or MCRCC register; the vendor kernel only switches the clock
+gates and runs the decoder at 200 MHz. The MPEG-1/2 microcode of the
+vendor kernel (amports/m6/ucode/mpeg12) uses the same mailbox protocol
+as the GXL firmware, loaded as meson/vdec/meson6_mpeg12.bin.
+
+The Meson6 canvases have no endianness control. Without a resolution
+change event the canvases are set up from the queued capture buffers
+when the decoder starts, so start it only once both queues stream and
+refuse SOURCE_CHANGE subscriptions for these formats.
+---
+ drivers/staging/media/meson/vdec/vdec.c       | 47 ++++++++++++++-----
+ drivers/staging/media/meson/vdec/vdec_1.c     | 18 ++++++-
+ .../staging/media/meson/vdec/vdec_helpers.c   | 10 ++--
+ .../staging/media/meson/vdec/vdec_platform.c  | 38 +++++++++++++++
+ .../staging/media/meson/vdec/vdec_platform.h  |  6 +++
+ 5 files changed, 102 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index fffafc77c..be2a275c4 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -299,6 +299,15 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	if (!sess->streamon_out)
+ 		return 0;
+ 
++	/*
++	 * Meson6: without a resolution change event the canvases are set up
++	 * from the queued capture buffers when the decoder starts. Starting
++	 * on OUTPUT alone points the firmware at unconfigured canvases.
++	 */
++	if (core->platform->meson6 && !sess->streamon_cap &&
++	    !(sess->fmt_out->flags & V4L2_FMT_FLAG_DYN_RESOLUTION))
++		return 0;
++
+ 	if (sess->status == STATUS_NEEDS_RESUME &&
+ 	    q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+ 	    sess->changed_format) {
+@@ -761,9 +770,17 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
+ static int vdec_subscribe_event(struct v4l2_fh *fh,
+ 				const struct v4l2_event_subscription *sub)
+ {
++	struct amvdec_session *sess =
++		container_of(fh, struct amvdec_session, fh);
++
+ 	switch (sub->type) {
+-	case V4L2_EVENT_EOS:
+ 	case V4L2_EVENT_SOURCE_CHANGE:
++		/* Meson6 MPEG-1/2: never sent, clients must not wait for it */
++		if (sess->core->platform->meson6 &&
++		    !(sess->fmt_out->flags & V4L2_FMT_FLAG_DYN_RESOLUTION))
++			return -EINVAL;
++		fallthrough;
++	case V4L2_EVENT_EOS:
+ 		return v4l2_event_subscribe(fh, sub, 0, NULL);
+ 	case V4L2_EVENT_CTRL:
+ 		return v4l2_ctrl_subscribe_event(fh, sub);
+@@ -978,6 +995,8 @@ static irqreturn_t vdec_threaded_isr(int irq, void *data)
+ }
+ 
+ static const struct of_device_id vdec_dt_match[] = {
++	{ .compatible = "amlogic,meson6-vdec",
++	  .data = &vdec_platform_meson6 },
+ 	{ .compatible = "amlogic,gxbb-vdec",
+ 	  .data = &vdec_platform_gxbb },
+ 	{ .compatible = "amlogic,gxm-vdec",
+@@ -1018,21 +1037,23 @@ static int vdec_probe(struct platform_device *pdev)
+ 	if (IS_ERR(core->esparser_base))
+ 		return PTR_ERR(core->esparser_base);
+ 
+-	core->regmap_ao =
+-		syscon_regmap_lookup_by_phandle(dev->of_node,
+-						"amlogic,ao-sysctrl");
+-	if (IS_ERR(core->regmap_ao)) {
+-		dev_err(dev, "Couldn't regmap AO sysctrl\n");
+-		return PTR_ERR(core->regmap_ao);
++	of_id = of_match_node(vdec_dt_match, dev->of_node);
++	core->platform = of_id->data;
++
++	if (!core->platform->meson6) {
++		core->regmap_ao =
++			syscon_regmap_lookup_by_phandle(dev->of_node,
++							"amlogic,ao-sysctrl");
++		if (IS_ERR(core->regmap_ao)) {
++			dev_err(dev, "Couldn't regmap AO sysctrl\n");
++			return PTR_ERR(core->regmap_ao);
++		}
+ 	}
+ 
+ 	core->canvas = meson_canvas_get(dev);
+ 	if (IS_ERR(core->canvas))
+ 		return PTR_ERR(core->canvas);
+ 
+-	of_id = of_match_node(vdec_dt_match, dev->of_node);
+-	core->platform = of_id->data;
+-
+ 	if (core->platform->revision == VDEC_REVISION_G12A ||
+ 	    core->platform->revision == VDEC_REVISION_SM1) {
+ 		core->vdec_hevcf_clk = devm_clk_get(dev, "vdec_hevcf");
+@@ -1052,7 +1073,11 @@ static int vdec_probe(struct platform_device *pdev)
+ 	if (IS_ERR(core->vdec_1_clk))
+ 		return -EPROBE_DEFER;
+ 
+-	core->vdec_hevc_clk = devm_clk_get(dev, "vdec_hevc");
++	/* Meson6 has no HEVC decoder */
++	if (core->platform->meson6)
++		core->vdec_hevc_clk = NULL;
++	else
++		core->vdec_hevc_clk = devm_clk_get(dev, "vdec_hevc");
+ 	if (IS_ERR(core->vdec_hevc_clk))
+ 		return -EPROBE_DEFER;
+ 
+diff --git a/drivers/staging/media/meson/vdec/vdec_1.c b/drivers/staging/media/meson/vdec/vdec_1.c
+index a65cb4959..087dd4c81 100644
+--- a/drivers/staging/media/meson/vdec/vdec_1.c
++++ b/drivers/staging/media/meson/vdec/vdec_1.c
+@@ -142,6 +142,10 @@ static void __vdec_1_stop(struct amvdec_session *sess)
+ 	amvdec_write_dos(core, DOS_SW_RESET0, 0);
+ 	amvdec_read_dos(core, DOS_SW_RESET0);
+ 
++	/* Meson6: no power domain, only the clock gates (vendor MOD_VDEC) */
++	if (core->platform->meson6)
++		goto stop_codec;
++
+ 	/* enable vdec1 isolation */
+ 	if (core->platform->revision == VDEC_REVISION_SM1)
+ 		regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_ISO0,
+@@ -158,6 +162,7 @@ static void __vdec_1_stop(struct amvdec_session *sess)
+ 		regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_SLEEP0,
+ 				   GEN_PWR_VDEC_1, GEN_PWR_VDEC_1);
+ 
++stop_codec:
+ 	if (sess->priv)
+ 		codec_ops->stop(sess);
+ }
+@@ -180,11 +185,21 @@ static int vdec_1_start(struct amvdec_session *sess)
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 
+ 	/* Configure the vdec clk to the maximum available */
+-	clk_set_rate(core->vdec_1_clk, 666666666);
++	clk_set_rate(core->vdec_1_clk,
++		     core->platform->meson6 ? 200000000 : 666666666);
+ 	ret = clk_prepare_enable(core->vdec_1_clk);
+ 	if (ret)
+ 		return ret;
+ 
++	if (core->platform->meson6) {
++		/* vendor: MOD_VDEC gate on, amvdec_start(), no power domain */
++		amvdec_write_dos(core, DOS_SW_RESET0, 0xfffffffc);
++		amvdec_write_dos(core, DOS_SW_RESET0, 0x00000000);
++		amvdec_write_dos(core, DOS_GCLK_EN0, 0xffffffff);
++		amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(31));
++		goto stbuf;
++	}
++
+ 	/* Enable power for VDEC_1 */
+ 	if (core->platform->revision == VDEC_REVISION_SM1)
+ 		regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_SLEEP0,
+@@ -214,6 +229,7 @@ static int vdec_1_start(struct amvdec_session *sess)
+ 	amvdec_write_dos(core, GCLK_EN, 0x3ff);
+ 	amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(31));
+ 
++stbuf:
+ 	vdec_1_stbuf_power_up(sess);
+ 
+ 	ret = vdec_1_load_firmware(sess, sess->fmt_out->firmware_path);
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+index 7d2a75653..dc944b767 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -116,19 +116,19 @@ static int set_canvas_yuv420m(struct amvdec_session *sess,
+ 	meson_canvas_config(core->canvas, canvas_id[0], buf_paddr[0],
+ 			    width, height, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+-			    MESON_CANVAS_ENDIAN_SWAP64);
++			    (sess->core->platform->meson6 ? 0 : MESON_CANVAS_ENDIAN_SWAP64));
+ 
+ 	/* U plane */
+ 	meson_canvas_config(core->canvas, canvas_id[1], buf_paddr[1],
+ 			    width / 2, height / 2, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+-			    MESON_CANVAS_ENDIAN_SWAP64);
++			    (sess->core->platform->meson6 ? 0 : MESON_CANVAS_ENDIAN_SWAP64));
+ 
+ 	/* V plane */
+ 	meson_canvas_config(core->canvas, canvas_id[2], buf_paddr[2],
+ 			    width / 2, height / 2, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+-			    MESON_CANVAS_ENDIAN_SWAP64);
++			    (sess->core->platform->meson6 ? 0 : MESON_CANVAS_ENDIAN_SWAP64));
+ 
+ 	amvdec_write_dos(core, reg,
+ 			 ((canvas_id[2]) << 16) |
+@@ -160,13 +160,13 @@ static int set_canvas_nv12m(struct amvdec_session *sess,
+ 	meson_canvas_config(core->canvas, canvas_id[0], buf_paddr[0],
+ 			    width, height, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+-			    MESON_CANVAS_ENDIAN_SWAP64);
++			    (sess->core->platform->meson6 ? 0 : MESON_CANVAS_ENDIAN_SWAP64));
+ 
+ 	/* U/V plane */
+ 	meson_canvas_config(core->canvas, canvas_id[1], buf_paddr[1],
+ 			    width, height / 2, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+-			    MESON_CANVAS_ENDIAN_SWAP64);
++			    (sess->core->platform->meson6 ? 0 : MESON_CANVAS_ENDIAN_SWAP64));
+ 
+ 	amvdec_write_dos(core, reg,
+ 			 ((canvas_id[1]) << 16) |
+diff --git a/drivers/staging/media/meson/vdec/vdec_platform.c b/drivers/staging/media/meson/vdec/vdec_platform.c
+index 66bb307db..beba6af22 100644
+--- a/drivers/staging/media/meson/vdec/vdec_platform.c
++++ b/drivers/staging/media/meson/vdec/vdec_platform.c
+@@ -13,6 +13,37 @@
+ #include "codec_h264.h"
+ #include "codec_vp9.h"
+ 
++/*
++ * Meson6: the MPEG-1/2 microcode of the vendor kernel
++ * (drivers/amlogic/amports/m6/ucode/mpeg12/vmpeg12_mc.c) uses the same
++ * mailbox protocol as the GXL firmware.
++ */
++static const struct amvdec_format vdec_formats_meson6[] = {
++	{
++		.pixfmt = V4L2_PIX_FMT_MPEG1,
++		.min_buffers = 8,
++		.max_buffers = 8,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_mpeg12_ops,
++		.firmware_path = "meson/vdec/meson6_mpeg12.bin",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++		.flags = V4L2_FMT_FLAG_COMPRESSED,
++	}, {
++		.pixfmt = V4L2_PIX_FMT_MPEG2,
++		.min_buffers = 8,
++		.max_buffers = 8,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_mpeg12_ops,
++		.firmware_path = "meson/vdec/meson6_mpeg12.bin",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++		.flags = V4L2_FMT_FLAG_COMPRESSED,
++	},
++};
++
+ static const struct amvdec_format vdec_formats_gxbb[] = {
+ 	{
+ 		.pixfmt = V4L2_PIX_FMT_H264,
+@@ -289,6 +320,13 @@ static const struct amvdec_format vdec_formats_sm1[] = {
+ 	},
+ };
+ 
++const struct vdec_platform vdec_platform_meson6 = {
++	.formats = vdec_formats_meson6,
++	.num_formats = ARRAY_SIZE(vdec_formats_meson6),
++	.revision = VDEC_REVISION_GXBB,
++	.meson6 = true,
++};
++
+ const struct vdec_platform vdec_platform_gxbb = {
+ 	.formats = vdec_formats_gxbb,
+ 	.num_formats = ARRAY_SIZE(vdec_formats_gxbb),
+diff --git a/drivers/staging/media/meson/vdec/vdec_platform.h b/drivers/staging/media/meson/vdec/vdec_platform.h
+index 88ca4a9db..e3b01f720 100644
+--- a/drivers/staging/media/meson/vdec/vdec_platform.h
++++ b/drivers/staging/media/meson/vdec/vdec_platform.h
+@@ -24,8 +24,14 @@ struct vdec_platform {
+ 	const struct amvdec_format *formats;
+ 	const u32 num_formats;
+ 	enum vdec_revision revision;
++	/*
++	 * Meson6: no VDEC power domain in the AO block, no VDEC memory
++	 * power-down and MCRCC registers, no canvas endianness, slower clock
++	 */
++	bool meson6;
+ };
+ 
++extern const struct vdec_platform vdec_platform_meson6;
+ extern const struct vdec_platform vdec_platform_gxbb;
+ extern const struct vdec_platform vdec_platform_gxm;
+ extern const struct vdec_platform vdec_platform_gxl;
+-- 
+2.53.0
+

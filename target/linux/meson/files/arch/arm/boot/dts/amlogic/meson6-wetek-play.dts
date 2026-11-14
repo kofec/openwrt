@@ -946,6 +946,31 @@
 };
 
 /*
+ * Video decoder (vendor: drivers/amlogic/amports): DOS registers at
+ * 0xc8010000 (IO_DOS_BUS), the ES parser in CBUS at the same address as on
+ * GXBB, VDEC mailbox 1A on SPI 44 and the parser on SPI 32 (also as on GXBB).
+ * No VDEC power domain on Meson6.
+ */
+&{/soc} {
+	video-decoder@c8010000 {
+		compatible = "amlogic,meson6-vdec";
+		reg = <0xc8010000 0x10000>,
+		      <0xc110a580 0xe4>;
+		reg-names = "dos", "esparser";
+		interrupts = <GIC_SPI 44 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 32 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "vdec", "esparser";
+		amlogic,canvas = <&canvas>;
+		clocks = <&clkc CLKID_DOS_PARSER>,
+			 <&clkc CLKID_DOS>,
+			 <&clkc CLKID_VDEC_1>;
+		clock-names = "dos_parser", "dos", "vdec_1";
+		resets = <&reset RESET_PARSER>;
+		reset-names = "esparser";
+	};
+};
+
+/*
  * AIU like on Meson8, with the Meson6 clocks (no separate S/PDIF master
  * clock). No FIFO interrupts on Meson6 (the vendor kernel polls with a timer,
  * nothing shows up in the GIC during playback): the driver polls as well.
