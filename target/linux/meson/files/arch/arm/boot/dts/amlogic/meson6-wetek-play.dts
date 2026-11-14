@@ -20,6 +20,7 @@
 #include <dt-bindings/leds/common.h>
 #include <dt-bindings/reset/amlogic,meson8b-reset.h>
 #include <dt-bindings/reset/amlogic,meson8b-clkc-reset.h>
+#include <dt-bindings/sound/meson-aiu.h>
 #include <dt-bindings/thermal/thermal.h>
 #include "meson6.dtsi"
 
@@ -293,6 +294,67 @@
 		pinctrl-names = "default";
 	};
 
+	/*
+	 * Vendor: "aml-audio" with a "dummy codec": I2S on GPIOE_1..4 goes to
+	 * an external DAC without a control interface (analog output),
+	 * S/PDIF on GPIOC_9 to the optical output and to the HDMI
+	 * transmitter. Use PCM device 1 (S/PDIF FIFO) for HDMI.
+	 */
+	sound {
+		compatible = "amlogic,gx-sound-card";
+		model = "WETEK-PLAY";
+
+		/* like Meson8m2 MXIII: one MPLL per sample rate family */
+		clocks = <&clkc CLKID_MPLL0>,
+			 <&clkc CLKID_MPLL1>;
+		assigned-clocks = <&clkc CLKID_MPLL0>,
+				  <&clkc CLKID_MPLL1>;
+		assigned-clock-rates = <270950400>,
+				       <294912000>;
+
+		dai-link-0 {
+			sound-dai = <&aiu AIU_CPU CPU_I2S_FIFO>;
+		};
+
+		dai-link-1 {
+			sound-dai = <&aiu AIU_CPU CPU_SPDIF_FIFO>;
+		};
+
+		dai-link-2 {
+			sound-dai = <&aiu AIU_CPU CPU_I2S_ENCODER>;
+			dai-format = "i2s";
+			mclk-fs = <256>;
+
+			codec-0 {
+				sound-dai = <&aiu AIU_HDMI CTRL_I2S>;
+			};
+		};
+
+		/*
+		 * Meson6 HDMI audio only works with the S/PDIF input of the HDMI
+		 * transmitter (like in the vendor kernel); I2S -> HDMI stays
+		 * silent. So the S/PDIF encoder feeds both the optical output
+		 * and the HDMI transmitter (hdmi-codec DAI 1 = spdif).
+		 */
+		dai-link-3 {
+			sound-dai = <&aiu AIU_CPU CPU_SPDIF_ENCODER>;
+
+			codec-0 {
+				sound-dai = <&spdif_dit>;
+			};
+
+			codec-1 {
+				sound-dai = <&hdmi_tx 1>;
+			};
+		};
+	};
+
+	spdif_dit: spdif-audio-codec {
+		compatible = "linux,spdif-dit";
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "DIT";
+	};
+
 	hdmi-connector {
 		compatible = "hdmi-connector";
 		type = "a";
@@ -416,6 +478,19 @@
 		hdmi_5v_pins: hdmi-5v-pins {
 			pinctrl-single,bits = <0x00 0x00000000 0x02000000>,
 					      <0x04 0x00000000 0x00010000>;
+		};
+
+		/* S/PDIF out on GPIOC_9: PIN_MUX_3 bit 24 (vendor aml_dummy_codec_pins) */
+		spdif_out_pins: spdif-out-pins {
+			pinctrl-single,bits = <0x0c 0x01000000 0x01000000>;
+		};
+
+		/*
+		 * I2S out (MCLK, BCLK, LRCLK, DOUT) on GPIOE_1..4: PIN_MUX_9 set
+		 * 0x2b0, clear 0x380c4e (vendor aml_dummy_codec_pins)
+		 */
+		i2s_out_pins: i2s-out-pins {
+			pinctrl-single,bits = <0x24 0x000002b0 0x00380efe>;
 		};
 
 		led_pins: led-pins {
@@ -803,6 +878,7 @@
 			interrupts = <GIC_SPI 57 IRQ_TYPE_EDGE_RISING>,
 				     <GIC_SPI 55 IRQ_TYPE_EDGE_RISING>;
 			interrupt-names = "hdmi", "cec";
+			#sound-dai-cells = <1>;
 			clocks = <&clkc CLKID_HDMI_PCLK>,
 				 <&clkc CLKID_HDMI_SYS>;
 			clock-names = "pclk", "sys";
@@ -837,4 +913,37 @@
 			reg = <0x6324 0x14>;
 		};
 	};
+};
+
+/*
+ * AIU like on Meson8, with the Meson6 clocks (no separate S/PDIF master
+ * clock). No FIFO interrupts on Meson6 (the vendor kernel polls with a timer,
+ * nothing shows up in the GIC during playback): the driver polls as well.
+ */
+&aiu {
+	compatible = "amlogic,aiu-meson6", "amlogic,aiu-meson8", "amlogic,aiu";
+	/delete-property/ interrupts;
+	/delete-property/ interrupt-names;
+	clocks = <&clkc CLKID_AIU_GLUE>,
+		 <&clkc CLKID_I2S_OUT>,
+		 <&clkc CLKID_AOCLK_GATE>,
+		 <&clkc CLKID_CTS_AMCLK>,
+		 <&clkc CLKID_MIXER_IFACE>,
+		 <&clkc CLKID_IEC958>,
+		 <&clkc CLKID_IEC958_GATE>,
+		 <&clkc CLKID_CTS_MCLK_I958>,
+		 <&clkc CLKID_CTS_I958>;
+	clock-names = "pclk",
+		      "i2s_pclk",
+		      "i2s_aoclk",
+		      "i2s_mclk",
+		      "i2s_mixer",
+		      "spdif_pclk",
+		      "spdif_aoclk",
+		      "spdif_mclk",
+		      "spdif_mclk_sel";
+	resets = <&reset RESET_AIU>;
+	pinctrl-0 = <&i2s_out_pins>, <&spdif_out_pins>;
+	pinctrl-names = "default";
+	status = "okay";
 };

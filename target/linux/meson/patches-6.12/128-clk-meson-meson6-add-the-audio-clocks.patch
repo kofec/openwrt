@@ -1,0 +1,372 @@
+From abb2ad57a9c72aef9bf935711ad4bef5e9c8e7fd Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Sat, 14 Nov 2026 07:42:45 +0000
+Subject: [PATCH] clk: meson: meson6: add the audio clocks
+
+MPLL0/1/2 (HHI_MPLL_CNTL7..9, same layout as on Meson8b) and the audio
+master clock (HHI_AUD_CLK_CNTL) like on Meson8b: the mux picks one of
+the fixed-rate MPLLs (at 12.288MHz straight from an MPLL the I2S output
+did not run). Meson6 has no separate S/PDIF master clock, S/PDIF uses
+AMCLK. AIU gates (IEC958 and AOCLK at other bits than on Meson8b).
+The S/PDIF gates (IEC958, ICE958_AMCLK) stay enabled and the audio
+clocks are CLK_IGNORE_UNUSED: gating them hangs the WeTek Play.
+---
+ drivers/clk/meson/Kconfig  |   1 +
+ drivers/clk/meson/meson6.c | 283 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 284 insertions(+)
+
+diff --git a/drivers/clk/meson/Kconfig b/drivers/clk/meson/Kconfig
+index 23a8dfd9b..abadc43d1 100644
+--- a/drivers/clk/meson/Kconfig
++++ b/drivers/clk/meson/Kconfig
+@@ -59,6 +59,7 @@ config COMMON_CLK_MESON6
+ 	select COMMON_CLK_MESON_REGMAP
+ 	select COMMON_CLK_MESON_CLKC_UTILS
+ 	select COMMON_CLK_MESON_PLL
++	select COMMON_CLK_MESON_MPLL
+ 	select MFD_SYSCON
+ 	help
+ 	  Support for the clock controller on AmLogic AML8726-MX (Meson6)
+diff --git a/drivers/clk/meson/meson6.c b/drivers/clk/meson/meson6.c
+index 272fd37a7..cd74fc8de 100644
+--- a/drivers/clk/meson/meson6.c
++++ b/drivers/clk/meson/meson6.c
+@@ -23,6 +23,7 @@
+ #include <linux/slab.h>
+ 
+ #include "clk-regmap.h"
++#include "clk-mpll.h"
+ #include "clk-pll.h"
+ #include "meson-clkc-utils.h"
+ 
+@@ -32,6 +33,11 @@
+ #define HHI_GCLK_MPEG0			0x140
+ #define HHI_GCLK_MPEG1			0x144
+ #define HHI_GCLK_MPEG2			0x148
++#define HHI_GCLK_OTHER			0x154
++#define HHI_AUD_CLK_CNTL		0x178
++#define HHI_MPLL_CNTL7			0x298
++#define HHI_MPLL_CNTL8			0x29c
++#define HHI_MPLL_CNTL9			0x2a0
+ #define HHI_VIID_CLK_DIV		0x128
+ #define HHI_VIID_CLK_CNTL		0x12c
+ #define HHI_VID_CLK_DIV			0x164
+@@ -1481,6 +1487,239 @@ static const struct reset_control_ops meson6_clk_reset_ops = {
+ 	.deassert = meson6_clk_reset_deassert,
+ };
+ 
++
++/*
++ * Audio: the audio master clock (AMCLK) comes from MPLL0/1/2 (HHI_MPLL_CNTL7..9,
++ * same layout as on Meson8b; the vendor kernel uses MPLL2) through
++ * HHI_AUD_CLK_CNTL (source 1..3 in bits 11..9, divider in bits 7..0, gate in
++ * bit 8). The MPLLs must run at a few hundred MHz (vendor: ~480MHz, /26):
++ * at 12.288MHz (N2 = 162) the I2S output did not run.
++ * Meson6 (unlike Meson6TV and Meson8) has no separate S/PDIF master clock,
++ * S/PDIF uses AMCLK as well.
++ *
++ * Gating the unused audio clocks at boot (clk_disable_unused) hangs the
++ * WeTek Play, the vendor kernel never gates them: CLK_IGNORE_UNUSED.
++ */
++static DEFINE_SPINLOCK(meson6_mpll_lock);
++
++static struct clk_regmap meson6_mpll0_div = {
++	.data = &(struct meson_clk_mpll_data){
++		.sdm = {
++			.reg_off = HHI_MPLL_CNTL7,
++			.shift   = 0,
++			.width   = 14,
++		},
++		.sdm_en = {
++			.reg_off = HHI_MPLL_CNTL7,
++			.shift   = 15,
++			.width   = 1,
++		},
++		.n2 = {
++			.reg_off = HHI_MPLL_CNTL7,
++			.shift   = 16,
++			.width   = 9,
++		},
++		.lock = &meson6_mpll_lock,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "mpll0_div",
++		.ops = &meson_clk_mpll_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_fixed_pll.hw
++		},
++		.num_parents = 1,
++	},
++};
++
++static struct clk_regmap meson6_mpll0 = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_MPLL_CNTL7,
++		.bit_idx = 14,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "mpll0",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_mpll0_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
++	},
++};
++
++static struct clk_regmap meson6_mpll1_div = {
++	.data = &(struct meson_clk_mpll_data){
++		.sdm = {
++			.reg_off = HHI_MPLL_CNTL8,
++			.shift   = 0,
++			.width   = 14,
++		},
++		.sdm_en = {
++			.reg_off = HHI_MPLL_CNTL8,
++			.shift   = 15,
++			.width   = 1,
++		},
++		.n2 = {
++			.reg_off = HHI_MPLL_CNTL8,
++			.shift   = 16,
++			.width   = 9,
++		},
++		.lock = &meson6_mpll_lock,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "mpll1_div",
++		.ops = &meson_clk_mpll_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_fixed_pll.hw
++		},
++		.num_parents = 1,
++	},
++};
++
++static struct clk_regmap meson6_mpll1 = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_MPLL_CNTL8,
++		.bit_idx = 14,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "mpll1",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_mpll1_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
++	},
++};
++
++static struct clk_regmap meson6_mpll2_div = {
++	.data = &(struct meson_clk_mpll_data){
++		.sdm = {
++			.reg_off = HHI_MPLL_CNTL9,
++			.shift   = 0,
++			.width   = 14,
++		},
++		.sdm_en = {
++			.reg_off = HHI_MPLL_CNTL9,
++			.shift   = 15,
++			.width   = 1,
++		},
++		.n2 = {
++			.reg_off = HHI_MPLL_CNTL9,
++			.shift   = 16,
++			.width   = 9,
++		},
++		.lock = &meson6_mpll_lock,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "mpll2_div",
++		.ops = &meson_clk_mpll_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_fixed_pll.hw
++		},
++		.num_parents = 1,
++	},
++};
++
++static struct clk_regmap meson6_mpll2 = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_MPLL_CNTL9,
++		.bit_idx = 14,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "mpll2",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_mpll2_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
++	},
++};
++
++static u32 meson6_cts_amclk_mux_table[] = { 1, 2, 3 };
++
++static struct clk_regmap meson6_cts_amclk_sel = {
++	.data = &(struct clk_regmap_mux_data){
++		.offset = HHI_AUD_CLK_CNTL,
++		.mask = 0x7,
++		.shift = 9,
++		.table = meson6_cts_amclk_mux_table,
++		.flags = CLK_MUX_ROUND_CLOSEST,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "cts_amclk_sel",
++		.ops = &clk_regmap_mux_ops,
++		/* like Meson8b: fixed MPLL rates, the mux picks the best one */
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_mpll0.hw,
++			&meson6_mpll1.hw,
++			&meson6_mpll2.hw
++		},
++		.num_parents = 3,
++	},
++};
++
++static struct clk_regmap meson6_cts_amclk_div = {
++	.data = &(struct clk_regmap_div_data) {
++		.offset = HHI_AUD_CLK_CNTL,
++		.shift = 0,
++		.width = 8,
++		.flags = CLK_DIVIDER_ROUND_CLOSEST,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "cts_amclk_div",
++		.ops = &clk_regmap_divider_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_cts_amclk_sel.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	},
++};
++
++static struct clk_regmap meson6_cts_amclk = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_AUD_CLK_CNTL,
++		.bit_idx = 8,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "cts_amclk",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_cts_amclk_div.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
++	},
++};
++
++/*
++ * S/PDIF master clock gate (vendor: GCLK_IDX_AIU_ICE958_AMCLK). It is used
++ * as "spdif_mclk_sel" by the AIU driver, which only re-parents it to AMCLK.
++ */
++static struct clk_regmap meson6_iec958_gate = {
++	.data = &(struct clk_regmap_gate_data){
++		.offset = HHI_GCLK_OTHER,
++		.bit_idx = 3,
++	},
++	.hw.init = &(struct clk_init_data){
++		.name = "iec958_gate",
++		.ops = &clk_regmap_gate_ops,
++		.parent_hws = (const struct clk_hw *[]) {
++			&meson6_cts_amclk.hw
++		},
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
++	},
++};
++
++static MESON6_GATE(meson6_aiu_glue, HHI_GCLK_MPEG1, 6);
++static MESON6_GATE(meson6_iec958, HHI_GCLK_MPEG1, 7);
++static MESON6_GATE(meson6_i2s_out, HHI_GCLK_MPEG1, 8);
++static MESON6_GATE(meson6_mixer_iface, HHI_GCLK_MPEG1, 12);
++static MESON6_GATE(meson6_aoclk_gate, HHI_GCLK_OTHER, 1);
++
+ /* clocks which are not exposed through the DT binding, parents first */
+ static struct clk_hw *meson6_internal_hws[] = {
+ 	&meson6_fixed_pll_dco.hw,
+@@ -1489,6 +1728,9 @@ static struct clk_hw *meson6_internal_hws[] = {
+ 	&meson6_cpu_in_div2.hw,
+ 	&meson6_cpu_in_div3.hw,
+ 	&meson6_cpu_scale_out_sel.hw,
++	&meson6_mpll0_div.hw,
++	&meson6_mpll1_div.hw,
++	&meson6_mpll2_div.hw,
+ 
+ };
+ 
+@@ -1520,6 +1762,20 @@ static struct clk_hw *meson6_hw_clks[] = {
+ 	[CLKID_UART2]			= &meson6_uart2.hw,
+ 	[CLKID_PERIPH]			= &meson6_periph_clk.hw,
+ 	[MESON6_CLKID_CLK_OUT3]		= &meson6_clk_out3.hw,
++	[CLKID_MPLL0]			= &meson6_mpll0.hw,
++	[CLKID_MPLL1]			= &meson6_mpll1.hw,
++	[CLKID_MPLL2]			= &meson6_mpll2.hw,
++	[CLKID_CTS_AMCLK_SEL]		= &meson6_cts_amclk_sel.hw,
++	[CLKID_CTS_AMCLK_DIV]		= &meson6_cts_amclk_div.hw,
++	[CLKID_CTS_AMCLK]		= &meson6_cts_amclk.hw,
++	[CLKID_CTS_MCLK_I958]		= &meson6_cts_amclk.hw,
++	[CLKID_CTS_I958]		= &meson6_iec958_gate.hw,
++	[CLKID_IEC958_GATE]		= &meson6_iec958_gate.hw,
++	[CLKID_AIU_GLUE]		= &meson6_aiu_glue.hw,
++	[CLKID_IEC958]			= &meson6_iec958.hw,
++	[CLKID_I2S_OUT]			= &meson6_i2s_out.hw,
++	[CLKID_MIXER_IFACE]		= &meson6_mixer_iface.hw,
++	[CLKID_AOCLK_GATE]		= &meson6_aoclk_gate.hw,
+ 	[CLKID_HDMI_PLL_DCO] = &meson6_hdmi_pll_dco.hw,
+ 	[CLKID_HDMI_PLL_LVDS_OUT] = &meson6_hdmi_pll_lvds_out.hw,
+ 	[CLKID_HDMI_PLL_HDMI_OUT] = &meson6_hdmi_pll_hdmi_out.hw,
+@@ -1639,6 +1895,21 @@ static struct clk_regmap *const meson6_clk_regmaps[] = {
+ 	&meson6_hdmi_pclk,
+ 	&meson6_gclk_venci_int,
+ 	&meson6_gclk_vencp_int,
++	&meson6_mpll0_div,
++	&meson6_mpll0,
++	&meson6_mpll1_div,
++	&meson6_mpll1,
++	&meson6_mpll2_div,
++	&meson6_mpll2,
++	&meson6_cts_amclk_sel,
++	&meson6_cts_amclk_div,
++	&meson6_cts_amclk,
++	&meson6_iec958_gate,
++	&meson6_aiu_glue,
++	&meson6_iec958,
++	&meson6_i2s_out,
++	&meson6_mixer_iface,
++	&meson6_aoclk_gate,
+ };
+ 
+ static struct meson_clk_hw_data meson6_clk_hw_data = {
+@@ -1680,6 +1951,10 @@ static void __init meson6_clkc_init(struct device_node *np)
+ 	}
+ 
+ 	/* source and divider of CLK_OUT3 as set up by the vendor kernel */
++	/* AMCLK from MPLL2 (vendor: audio_set_clk()), AIU_AMCLK gate on */
++	regmap_update_bits(map, HHI_AUD_CLK_CNTL, GENMASK(11, 9), 3 << 9);
++	regmap_update_bits(map, HHI_GCLK_OTHER, BIT(2), BIT(2));
++
+ 	regmap_update_bits(map, HHI_GEN_CLK_CNTL2, BIT(22) | GENMASK(18, 13),
+ 			   BIT(22));
+ 
+@@ -1716,6 +1991,14 @@ static void __init meson6_clkc_init(struct device_node *np)
+ 	clk_prepare_enable(meson6_gclk_venci_int.hw.clk);
+ 	clk_prepare_enable(meson6_gclk_vencp_int.hw.clk);
+ 
++	/*
++	 * Gating the S/PDIF clocks (IEC958, ICE958_AMCLK) hangs the WeTek Play
++	 * (at boot as unused clocks and when an S/PDIF stream is stopped); the
++	 * vendor kernel never gates them.
++	 */
++	clk_prepare_enable(meson6_iec958.hw.clk);
++	clk_prepare_enable(meson6_iec958_gate.hw.clk);
++
+ 	ret = of_clk_add_hw_provider(np, meson_clk_hw_get, &meson6_clk_hw_data);
+ 	if (ret)
+ 		pr_err("%s: failed to register the clock provider\n", __func__);

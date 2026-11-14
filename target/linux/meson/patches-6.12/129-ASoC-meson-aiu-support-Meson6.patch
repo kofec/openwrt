@@ -1,0 +1,223 @@
+From cbe00946ee598204e72bbf86591c119a5ce24c7a Mon Sep 17 00:00:00 2001
+From: kofec <kofec@localhost>
+Date: Sat, 14 Nov 2026 07:42:46 +0000
+Subject: [PATCH] ASoC: meson: aiu: support Meson6
+
+- the AIU FIFOs on Meson6 have no interrupt (nothing shows up in the GIC
+  during playback, the vendor kernel polls with a timer): without the
+  i2s/spdif interrupts the FIFO read pointer is polled every half period
+- amlogic,aiu-meson6: the HDMI transmitter takes its audio clock from the
+  AIU HDMI control even when fed from S/PDIF, so select I2S there
+---
+ sound/soc/meson/aiu-fifo.c | 66 +++++++++++++++++++++++++++++++++++++-
+ sound/soc/meson/aiu-fifo.h | 12 +++++++
+ sound/soc/meson/aiu.c      | 25 ++++++++++++---
+ sound/soc/meson/aiu.h      |  1 +
+ 4 files changed, 99 insertions(+), 5 deletions(-)
+
+diff --git a/sound/soc/meson/aiu-fifo.c b/sound/soc/meson/aiu-fifo.c
+index b222bde1f..b70eaa502 100644
+--- a/sound/soc/meson/aiu-fifo.c
++++ b/sound/soc/meson/aiu-fifo.c
+@@ -6,6 +6,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
+ #include <linux/dma-mapping.h>
++#include <linux/jiffies.h>
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dai.h>
+@@ -55,19 +56,69 @@ static void aiu_fifo_enable(struct snd_soc_dai *dai, bool enable)
+ 				      en_mask, enable ? en_mask : 0);
+ }
+ 
++/*
++ * Meson6 has no AIU FIFO interrupt (the vendor kernel polls with a timer):
++ * check the read pointer every half period and signal elapsed periods.
++ * snd_soc_component_read() takes a mutex, so this runs in a work item.
++ */
++static void aiu_fifo_poll(struct work_struct *work)
++{
++	struct aiu_fifo *fifo = container_of(to_delayed_work(work),
++					     struct aiu_fifo, poll_work);
++	struct snd_pcm_substream *substream = fifo->substream;
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	snd_pcm_uframes_t period;
++
++	if (!READ_ONCE(fifo->polling))
++		return;
++
++	period = aiu_fifo_pointer(fifo->component, substream) /
++		 runtime->period_size;
++	if (period != fifo->last_period) {
++		fifo->last_period = period;
++		snd_pcm_period_elapsed(substream);
++	}
++
++	if (READ_ONCE(fifo->polling))
++		queue_delayed_work(system_highpri_wq, &fifo->poll_work,
++				   fifo->poll_jiffies);
++}
++
++static void aiu_fifo_poll_start(struct aiu_fifo *fifo,
++				struct snd_pcm_substream *substream)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	unsigned int period_ms;
++
++	period_ms = runtime->period_size * 1000 / runtime->rate;
++	fifo->poll_jiffies = max(1UL, msecs_to_jiffies(period_ms / 2));
++	fifo->last_period = 0;
++	WRITE_ONCE(fifo->polling, true);
++	queue_delayed_work(system_highpri_wq, &fifo->poll_work,
++			   fifo->poll_jiffies);
++}
++
+ int aiu_fifo_trigger(struct snd_pcm_substream *substream, int cmd,
+ 		     struct snd_soc_dai *dai)
+ {
++	struct aiu_fifo *fifo = snd_soc_dai_dma_data_get_playback(dai);
++
+ 	switch (cmd) {
+ 	case SNDRV_PCM_TRIGGER_START:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+ 		aiu_fifo_enable(dai, true);
++		if (fifo->irq < 0)
++			aiu_fifo_poll_start(fifo, substream);
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+ 	case SNDRV_PCM_TRIGGER_STOP:
+ 		aiu_fifo_enable(dai, false);
++		if (fifo->irq < 0) {
++			WRITE_ONCE(fifo->polling, false);
++			cancel_delayed_work(&fifo->poll_work);
++		}
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -157,6 +208,14 @@ int aiu_fifo_startup(struct snd_pcm_substream *substream,
+ 	if (ret)
+ 		return ret;
+ 
++	if (fifo->irq < 0) {
++		fifo->substream = substream;
++		fifo->component = dai->component;
++		fifo->polling = false;
++		INIT_DELAYED_WORK(&fifo->poll_work, aiu_fifo_poll);
++		return 0;
++	}
++
+ 	ret = request_irq(fifo->irq, aiu_fifo_isr, 0, dev_name(dai->dev),
+ 			  substream);
+ 	if (ret)
+@@ -170,7 +229,12 @@ void aiu_fifo_shutdown(struct snd_pcm_substream *substream,
+ {
+ 	struct aiu_fifo *fifo = snd_soc_dai_dma_data_get_playback(dai);
+ 
+-	free_irq(fifo->irq, substream);
++	if (fifo->irq < 0) {
++		WRITE_ONCE(fifo->polling, false);
++		cancel_delayed_work_sync(&fifo->poll_work);
++	} else {
++		free_irq(fifo->irq, substream);
++	}
+ 	clk_disable_unprepare(fifo->pclk);
+ }
+ 
+diff --git a/sound/soc/meson/aiu-fifo.h b/sound/soc/meson/aiu-fifo.h
+index b02cfcc4d..0336cd565 100644
+--- a/sound/soc/meson/aiu-fifo.h
++++ b/sound/soc/meson/aiu-fifo.h
+@@ -16,6 +16,10 @@ struct snd_pcm_substream;
+ struct snd_soc_dai;
+ struct snd_pcm_hw_params;
+ struct platform_device;
++struct snd_soc_component;
++
++#include <linux/workqueue.h>
++#include <sound/pcm.h>
+ 
+ struct aiu_fifo {
+ 	const struct snd_pcm_hardware *pcm;
+@@ -23,6 +27,14 @@ struct aiu_fifo {
+ 	unsigned int fifo_block;
+ 	struct clk *pclk;
+ 	int irq;
++
++	/* Meson6: no FIFO interrupt, the read pointer is polled */
++	struct delayed_work poll_work;
++	struct snd_pcm_substream *substream;
++	struct snd_soc_component *component;
++	snd_pcm_uframes_t last_period;
++	unsigned long poll_jiffies;
++	bool polling;
+ };
+ 
+ int aiu_fifo_dai_probe(struct snd_soc_dai *dai);
+diff --git a/sound/soc/meson/aiu.c b/sound/soc/meson/aiu.c
+index f2890111c..ded09739b 100644
+--- a/sound/soc/meson/aiu.c
++++ b/sound/soc/meson/aiu.c
+@@ -270,12 +270,13 @@ static int aiu_probe(struct platform_device *pdev)
+ 		return PTR_ERR(map);
+ 	}
+ 
+-	aiu->i2s.irq = platform_get_irq_byname(pdev, "i2s");
+-	if (aiu->i2s.irq < 0)
++	/* Meson6 has no FIFO interrupts: the FIFO pointer is polled */
++	aiu->i2s.irq = platform_get_irq_byname_optional(pdev, "i2s");
++	if (aiu->i2s.irq < 0 && aiu->i2s.irq != -ENXIO)
+ 		return aiu->i2s.irq;
+ 
+-	aiu->spdif.irq = platform_get_irq_byname(pdev, "spdif");
+-	if (aiu->spdif.irq < 0)
++	aiu->spdif.irq = platform_get_irq_byname_optional(pdev, "spdif");
++	if (aiu->spdif.irq < 0 && aiu->spdif.irq != -ENXIO)
+ 		return aiu->spdif.irq;
+ 
+ 	ret = aiu_clk_get(dev);
+@@ -291,6 +292,10 @@ static int aiu_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	/* Meson6: "AIU HDMI CTRL SRC" = I2S (clock and data) by default */
++	if (aiu->platform->hdmi_clk_from_aiu)
++		regmap_update_bits(map, AIU_HDMI_CLK_DATA_CTRL, 0x33, 0x22);
++
+ 	/* Register the hdmi codec control component */
+ 	ret = aiu_hdmi_ctrl_register_component(dev);
+ 	if (ret) {
+@@ -334,7 +339,19 @@ static const struct aiu_platform_data aiu_meson8_pdata = {
+ 	.has_clk_ctrl_more_i2s_div = false,
+ };
+ 
++/*
++ * Meson6: HDMI audio only works through the S/PDIF input of the HDMI
++ * transmitter, and the transmitter still takes its audio clock from the AIU
++ * HDMI control (silence with "DISABLED", verified on the WeTek Play).
++ */
++static const struct aiu_platform_data aiu_meson6_pdata = {
++	.has_acodec = false,
++	.has_clk_ctrl_more_i2s_div = false,
++	.hdmi_clk_from_aiu = true,
++};
++
+ static const struct of_device_id aiu_of_match[] = {
++	{ .compatible = "amlogic,aiu-meson6", .data = &aiu_meson6_pdata },
+ 	{ .compatible = "amlogic,aiu-gxbb", .data = &aiu_gxbb_pdata },
+ 	{ .compatible = "amlogic,aiu-gxl", .data = &aiu_gxl_pdata },
+ 	{ .compatible = "amlogic,aiu-meson8", .data = &aiu_meson8_pdata },
+diff --git a/sound/soc/meson/aiu.h b/sound/soc/meson/aiu.h
+index 0f94c8bf6..d2cb65f5d 100644
+--- a/sound/soc/meson/aiu.h
++++ b/sound/soc/meson/aiu.h
+@@ -30,6 +30,7 @@ struct aiu_interface {
+ struct aiu_platform_data {
+ 	bool has_acodec;
+ 	bool has_clk_ctrl_more_i2s_div;
++	bool hdmi_clk_from_aiu;
+ };
+ 
+ struct aiu {
