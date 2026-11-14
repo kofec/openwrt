@@ -60,7 +60,7 @@ Added, still being verified:
 
 - Mali-400 MP2 GPU through `lima` and Mesa (`libmesa-lima` and `kmscube`
   from the `video` feed as packages): `kmscube` runs at ~60 fps with
-  cpufreq active (tested with a RAM-booted kernel). The OSD plane has no
+  cpufreq active. The OSD plane has no
   XRGB8888, use `kmscube -f AR24 -D /dev/dri/card1` (lima is `card0`).
 
 Not supported: video decoding, NAND.
