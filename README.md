@@ -63,7 +63,12 @@ Added, still being verified:
   cpufreq active. The OSD plane has no
   XRGB8888, use `kmscube -f AR24 -D /dev/dri/card1` (lima is `card0`).
 
-Not supported: video decoding, NAND.
+- MPEG-1/2 hardware decoding through the staging `meson-vdec` V4L2 driver
+  (`/dev/video0`, stateful decoder, NV12M/YUV420M) with the vendor microcode
+  in `/lib/firmware/meson/vdec/meson6_mpeg12.bin`; tested with `v4l2-ctl`
+  (`v4l-utils` package) on a 576p stream from a RAM-booted kernel
+
+Not supported: H.264 and other codecs, video output of decoded frames, NAND.
 
 ## What this branch adds
 
@@ -90,12 +95,18 @@ Meson6 device tree is removed upstream from 6.13 on):
 | `132-clk-meson-meson6-park-the-other-core-while-switching.patch` | the other core is parked while the CPU clock is switched, as the vendor kernel does; without it the box locks up when cpufreq changes the CPU rate while the GPU is busy |
 | `133-drm-lima-run-the-Meson6-power-on-GP-job.patch` | the vendor power-on GP job (Mali-400 rev B); without it every GP job hangs |
 | `134-drm-lima-poll-the-PP-MMUs-on-Meson6.patch` | the PP MMU interrupts do not reach the GIC on Meson6, poll them like the vendor driver |
+| `135-clk-meson-meson6-add-the-video-decoder-clocks.patch` | DOS and DOS parser gates, VDEC_1 clock |
+| `136-media-meson-vdec-add-Meson6-MPEG-1-2-support.patch` | Meson6 in the staging video decoder: same DOS/parser registers as GX at another base, no power domain, MPEG-1/2 with the vendor microcode |
+| `137-media-meson-vdec-swap-the-Meson6-pictures-through-pr.patch` | the Meson6 canvases cannot swap bytes: decode into private buffers and copy byte swapped (NEON) into the V4L2 buffers |
 
 Target `target/linux/meson`:
 
 - device tree `meson6-wetek-play.dts` (pin muxing via `pinctrl-single`,
   GPIO via `gpio-mmio`, regulators, LEDs, IR, efuse, thermal zone, OPPs,
-  VPU/HDMI/CEC, sound card with I2S, S/PDIF and HDMI, Mali GPU)
+  VPU/HDMI/CEC, sound card with I2S, S/PDIF and HDMI, Mali GPU, video
+  decoder)
+- the MPEG-1/2 decoder microcode in `base-files/lib/firmware/meson/vdec/`
+  (generated from `vmpeg12_mc.c` of the GPL vendor kernel)
 - SD card image (`sdcard.img.gz`) and `sysupgrade.img.gz` with metadata,
   `platform.sh` for sysupgrade that keeps the configuration backup on the
   FAT partition
