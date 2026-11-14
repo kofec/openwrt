@@ -9,7 +9,7 @@ is unrelated: it keeps OpenWrt 19.07 alive for 4/32 MB TP-Link routers.
 
 The aim is to give the box a second life as a small home server
 (Docker, Domoticz, NFS) instead of the Android it shipped with; the HDMI
-output, CEC and HDMI audio work as well. It is not an official OpenWrt target and has not been sent
+output, CEC, HDMI audio and the Mali GPU work as well. It is not an official OpenWrt target and has not been sent
 upstream.
 
 ## Hardware
@@ -58,7 +58,12 @@ Added, still being verified:
 - analog audio (I2S to the external DAC, PCM device 0) and the optical
   S/PDIF output: play fine, not listened to yet
 
-Not supported: Mali GPU, video decoding, NAND.
+- Mali-400 MP2 GPU through `lima` and Mesa (`libmesa-lima` and `kmscube`
+  from the `video` feed as packages): `kmscube` runs at ~60 fps with
+  cpufreq active (tested with a RAM-booted kernel). The OSD plane has no
+  XRGB8888, use `kmscube -f AR24 -D /dev/dri/card1` (lima is `card0`).
+
+Not supported: video decoding, NAND.
 
 ## What this branch adds
 
@@ -81,12 +86,16 @@ Meson6 device tree is removed upstream from 6.13 on):
 | `128-clk-meson-meson6-add-the-audio-clocks.patch` | MPLL0/1/2 and the audio master clock |
 | `129-ASoC-meson-aiu-support-Meson6.patch` | AIU without FIFO interrupts (polled), AIU HDMI clock for the transmitter |
 | `130-drm-meson-transwitch-hdmi-HDMI-audio-through-hdmi-co.patch` | HDMI audio through `hdmi-codec`; on Meson6 only the S/PDIF input of the transmitter works |
+| `131-clk-meson-meson6-add-the-Mali-clock.patch` | Mali clock (`HHI_MALI_CLK_CNTL`), 333 MHz from `fclk_div3` like the vendor kernel |
+| `132-clk-meson-meson6-park-the-other-core-while-switching.patch` | the other core is parked while the CPU clock is switched, as the vendor kernel does; without it the box locks up when cpufreq changes the CPU rate while the GPU is busy |
+| `133-drm-lima-run-the-Meson6-power-on-GP-job.patch` | the vendor power-on GP job (Mali-400 rev B); without it every GP job hangs |
+| `134-drm-lima-poll-the-PP-MMUs-on-Meson6.patch` | the PP MMU interrupts do not reach the GIC on Meson6, poll them like the vendor driver |
 
 Target `target/linux/meson`:
 
 - device tree `meson6-wetek-play.dts` (pin muxing via `pinctrl-single`,
   GPIO via `gpio-mmio`, regulators, LEDs, IR, efuse, thermal zone, OPPs,
-  VPU/HDMI/CEC, sound card with I2S, S/PDIF and HDMI)
+  VPU/HDMI/CEC, sound card with I2S, S/PDIF and HDMI, Mali GPU)
 - SD card image (`sdcard.img.gz`) and `sysupgrade.img.gz` with metadata,
   `platform.sh` for sysupgrade that keeps the configuration backup on the
   FAT partition
