@@ -7,9 +7,9 @@ AML8726-MX). The default branch of this repository,
 [`openwrt-19.07`](https://github.com/kofec/openwrt/tree/openwrt-19.07),
 is unrelated: it keeps OpenWrt 19.07 alive for 4/32 MB TP-Link routers.
 
-The aim is to give the box a second life as a small headless home
-server (Docker, Domoticz, NFS) instead of the Android it shipped
-with. It is not an official OpenWrt target and has not been sent
+The aim is to give the box a second life as a small home server
+(Docker, Domoticz, NFS) instead of the Android it shipped with; the HDMI
+output, CEC and HDMI audio work as well. It is not an official OpenWrt target and has not been sent
 upstream.
 
 ## Hardware
@@ -43,14 +43,22 @@ Working on the hardware:
 - efuse readable through nvmem
 - sysupgrade (whole card or partition by partition, configuration kept)
 - Docker, with its data on the overlay
+- HDMI output: DRM/KMS (`meson-drm` with the TranSwitch HDMI transmitter),
+  EDID, framebuffer console at 1080p60 (480p/576p, 720p/1080i and 1080p
+  modes only, like the vendor kernel)
+- HDMI CEC (`/dev/cec0`): tested with a Sony TV (power status, OSD name,
+  Image View On, Standby — the TV only accepts Standby after Active Source)
+- audio over HDMI (ALSA card `WETEK-PLAY`, PCM device 1)
 
 Added, still being verified:
 
 - Bluetooth on the AP6210 (`hci_bcm`)
 - Ethernet MAC from the efuse instead of the U-Boot command line
 - 1416 and 1512 MHz as boost frequencies
+- analog audio (I2S to the external DAC, PCM device 0) and the optical
+  S/PDIF output: play fine, not listened to yet
 
-Not supported: HDMI output and video decoding, audio, NAND.
+Not supported: Mali GPU, video decoding, NAND.
 
 ## What this branch adds
 
@@ -65,11 +73,20 @@ Meson6 device tree is removed upstream from 6.13 on):
 | `103-clk-meson-add-meson6-clkc.patch` | clock controller: gates, CPU clock, system PLL reprogramming, 32 kHz clock for Wi-Fi |
 | `104-iio-adc-meson-saradc-add-meson6.patch` | SAR ADC with the SoC temperature sensor |
 | `105-regulator-pwm-regulator-init-microvolt.patch` | defined start voltage for the PWM CPU regulator |
+| `110`–`121` | Meson8/8b/8m2 display support in drm/meson by Martin Blumenstingl (VPU, TranSwitch HDMI transmitter), from [xdarklight/linux](https://github.com/xdarklight/linux) `meson-mx-integration-6.13-20250112`, as they are (the 24 bpp framebuffer patch is already in 6.12, the Meson8b PHY limits are left out, `meson_vpu_init` is folded into `122`) |
+| `122`–`124` | port of the above to 6.12 (VCLK in Hz, HDMI audio bridge hooks disabled), `TX_HDMI_PHY_CONFIG1` offset fix |
+| `125-clk-meson-meson6-add-the-video-clocks.patch` | Meson6 video clock tree: video PLL (bit 30 is power-down), VCLK, VENC/HDMI gates, video divider resets |
+| `126-drm-meson-add-Meson6-AML8726-MX-support.patch` | Meson6 VPU (registers in CBUS), 8-bit OSD alpha, HDMI PHY in the transmitter registers, inverted TMDS resets |
+| `127-drm-meson-transwitch-hdmi-add-the-Meson6-CEC-control.patch` | CEC: the GX AO-CEC controller, but inside the HDMI TX register space |
+| `128-clk-meson-meson6-add-the-audio-clocks.patch` | MPLL0/1/2 and the audio master clock |
+| `129-ASoC-meson-aiu-support-Meson6.patch` | AIU without FIFO interrupts (polled), AIU HDMI clock for the transmitter |
+| `130-drm-meson-transwitch-hdmi-HDMI-audio-through-hdmi-co.patch` | HDMI audio through `hdmi-codec`; on Meson6 only the S/PDIF input of the transmitter works |
 
 Target `target/linux/meson`:
 
 - device tree `meson6-wetek-play.dts` (pin muxing via `pinctrl-single`,
-  GPIO via `gpio-mmio`, regulators, LEDs, IR, efuse, thermal zone, OPPs)
+  GPIO via `gpio-mmio`, regulators, LEDs, IR, efuse, thermal zone, OPPs,
+  VPU/HDMI/CEC, sound card with I2S, S/PDIF and HDMI)
 - SD card image (`sdcard.img.gz`) and `sysupgrade.img.gz` with metadata,
   `platform.sh` for sysupgrade that keeps the configuration backup on the
   FAT partition
