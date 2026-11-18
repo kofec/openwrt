@@ -50,10 +50,4 @@ RUN apk add --no-cache \
     'zlib-dev' \
   && \
   ln -s '/usr/lib/libncurses.so' '/usr/lib/libtinfo.so' && \
-  #addgroup 'Nokia' -g 55555 && \
-  # adduser -s '/bin/bash' -G 'Nokia' -D amk082
-  #useradd -m -u 61400216 -g 55555 -o -s /bin/bash amk082
-#RUN cp /root/.gitconfig /home/amk082/
-#RUN chown amk082:Nokia /home/amk082/.gitconfig
-
 USER kofec
