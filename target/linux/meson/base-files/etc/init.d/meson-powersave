@@ -1,0 +1,24 @@
+#!/bin/sh /etc/rc.common
+# WeTek Play: keep the box cool when idle.
+# - CPU up to 792 MHz: VCCK stays at 1.01 V (1.24-1.32 V above); without a
+#   heatsink the SoC reached the 110 C critical trip under load
+# - USB and disks autosuspend: an awake dwc2 port raises ~8000 SOF
+#   interrupts per second and the CPU never idles
+
+START=99
+
+start() {
+	local p
+
+	for p in /sys/devices/system/cpu/cpufreq/policy*; do
+		[ -w "$p/scaling_max_freq" ] && echo 792000 > "$p/scaling_max_freq"
+	done
+	for p in /sys/bus/usb/devices/*/power/control; do
+		echo auto > "$p"
+	done
+	for p in /sys/block/sd*/device/power; do
+		[ -d "$p" ] || continue
+		echo 2000 > "$p/autosuspend_delay_ms"
+		echo auto > "$p/control"
+	done
+}

@@ -1,0 +1,4 @@
+# USB devices plugged later: allow runtime suspend (see meson-powersave)
+[ "$ACTION" = add ] || exit 0
+[ -w "/sys$DEVPATH/power/control" ] && echo auto > "/sys$DEVPATH/power/control"
+exit 0
