@@ -1,0 +1,55 @@
+From: kofec
+Subject: [PATCH] drm/meson: transwitch-hdmi: Meson6 CEC, read the TX result after the frame time
+
+Every CEC interrupt, also one for a received message, schedules the
+transmit work at once while a transmit is pending. The status read that
+early can still hold the previous frame's result, so a logical address
+poll could be reported as acknowledged: on one boot the kernel took
+logical address 2 while libcec (Kodi) kept sending as 1 and every frame
+was rejected ("initiator has unknown logical address 1").
+
+Only look at the status once the frame could have been sent, len * 24 +
+5 ms after the request, as the vendor cec_ll_tx_polling() does.
+
+diff -urN a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c
+--- a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c	2026-11-19 12:23:00.281888361 +0000
++++ b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c	2026-11-19 12:23:00.284566281 +0000
+@@ -61,6 +61,7 @@
+ 	struct cec_adapter		*cec_adap;
+ 	struct delayed_work		cec_tx_work;
+ 	unsigned long			cec_tx_deadline;
++	unsigned long			cec_tx_min;
+ 	unsigned long			cec_irq_window;
+ 	unsigned int			cec_irq_count;
+ 	bool				cec_tx_pending;
+@@ -961,6 +962,11 @@
+ 	meson_txc_cec_write(priv, CEC_TX_MSG_CMD, CEC_TX_REQ_CURRENT);
+ 
+ 	priv->cec_tx_pending = true;
++	/*
++	 * vendor cec_ll_tx_polling(): the status only means something after
++	 * the frame could have been sent, len * 24 + 5 ms
++	 */
++	priv->cec_tx_min = jiffies + msecs_to_jiffies(msg->len * 24 + 5);
+ 	priv->cec_tx_deadline = jiffies + msecs_to_jiffies(CEC_TX_TIMEOUT_MS);
+ 	mod_delayed_work(system_wq, &priv->cec_tx_work,
+ 			 msecs_to_jiffies(CEC_TX_POLL_MS));
+@@ -979,6 +985,18 @@
+ 	if (!priv->cec_tx_pending)
+ 		return;
+ 
++	/*
++	 * Any CEC interrupt (e.g. the TV talking) kicks this work at once;
++	 * reading the status that early can return the previous frame's
++	 * result. A poll message "acknowledged" that way made the kernel
++	 * skip a free logical address while libcec kept using it.
++	 */
++	if (time_before(jiffies, priv->cec_tx_min)) {
++		schedule_delayed_work(&priv->cec_tx_work,
++				      priv->cec_tx_min - jiffies);
++		return;
++	}
++
+ 	stat = meson_txc_cec_read(priv, CEC_TX_MSG_STATUS);
+ 	switch (stat) {
+ 	case CEC_TX_DONE:
