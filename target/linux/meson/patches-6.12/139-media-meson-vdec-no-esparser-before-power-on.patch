@@ -1,0 +1,34 @@
+From: kofec
+Subject: [PATCH] media: meson: vdec: don't feed the ESPARSER before the decoder is up
+
+esparser_queue_all_src() runs from buf_queue as soon as the OUTPUT queue
+streams. On Meson6 the decoder (and the parser clock) only starts once
+the CAPTURE queue streams too, and when that start fails - seen with
+Kodi holding most of the 64 MB CMA area, "Failed to request VIFIFO
+buffer" - streamon_out stays set. The next OUTPUT QBUF then wrote to the
+parser registers with the clock off and the SoC reset without a message.
+
+Skip the work while the session is stopped or has no VIFIFO.
+
+diff -urN a/drivers/staging/media/meson/vdec/esparser.c b/drivers/staging/media/meson/vdec/esparser.c
+--- a/drivers/staging/media/meson/vdec/esparser.c	2026-11-19 08:17:55.578596016 +0000
++++ b/drivers/staging/media/meson/vdec/esparser.c	2026-11-19 08:17:55.579028437 +0000
+@@ -376,6 +376,18 @@
+ 		container_of(work, struct amvdec_session, esparser_queue_work);
+ 
+ 	mutex_lock(&sess->lock);
++
++	/*
++	 * Nothing to parse into until the decoder is powered on: on Meson6 it
++	 * only starts with both queues streaming, and a failed start (e.g. no
++	 * CMA memory left for the VIFIFO) leaves streamon_out set. Touching
++	 * the parser with its clock off hangs the bus and resets the SoC.
++	 */
++	if (sess->status == STATUS_STOPPED || !sess->vififo_vaddr) {
++		mutex_unlock(&sess->lock);
++		return;
++	}
++
+ 	v4l2_m2m_for_each_src_buf_safe(sess->m2m_ctx, buf, n) {
+ 		if (sess->should_stop)
+ 			break;

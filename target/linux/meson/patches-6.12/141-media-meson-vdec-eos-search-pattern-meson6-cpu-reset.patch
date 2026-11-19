@@ -1,0 +1,199 @@
+From: kofec
+Subject: [PATCH] media: meson: vdec: close the EOS packet, reset the Meson6 firmware CPUs
+
+esparser_queue_eos() wrote the EOS sequence followed by zeros only, while
+every other packet ends with a 00 00 01 ff search pattern that closes it
+in the parser. The end of sequence code then only sometimes reached the
+VLD and the MPEG-2 firmware usually kept its last reference picture
+(72 of 73 pictures). Terminate the EOS data the same way.
+
+The vendor amvdec_start()/amvdec_stop() on Meson6 reset the firmware
+processors (DOS_SW_RESET0 bits 12/11, with CBUS dummy reads) around
+MPSR, and wait for the IMEM DMA when stopping. Do that before starting
+the firmware and when the MPEG-1/2 watchdog restarts it: with MPSR alone
+the processor resumed with a stale state and decoded nothing afterwards.
+
+diff -urN a/drivers/staging/media/meson/vdec/codec_mpeg12.c b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+--- a/drivers/staging/media/meson/vdec/codec_mpeg12.c	2026-11-19 09:57:42.973744437 +0000
++++ b/drivers/staging/media/meson/vdec/codec_mpeg12.c	2026-11-19 09:57:42.977499947 +0000
+@@ -230,8 +230,7 @@
+ 			     mpeg12->resets);
+ 
+ 	amvdec_write_dos(core, ASSIST_MBOX1_MASK, 0);
+-	amvdec_write_dos(core, MPSR, 0);
+-	amvdec_write_dos(core, CPSR, 0);
++	amvdec_meson6_cpu_stop(core);
+ 
+ 	vld = amvdec_read_dos(core, POWER_CTL_VLD);
+ 	amvdec_write_dos(core, DOS_SW_RESET0, BIT(7) | BIT(6) | BIT(4));
+@@ -259,6 +258,7 @@
+ 		amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+ 
+ 	amvdec_write_dos(core, ASSIST_MBOX1_MASK, 1);
++	amvdec_meson6_cpu_reset(core);
+ 	amvdec_write_dos(core, MPSR, 1);
+ 
+ 	return true;
+diff -urN a/drivers/staging/media/meson/vdec/esparser.c b/drivers/staging/media/meson/vdec/esparser.c
+--- a/drivers/staging/media/meson/vdec/esparser.c	2026-11-19 09:57:42.973061201 +0000
++++ b/drivers/staging/media/meson/vdec/esparser.c	2026-11-19 09:57:42.980484981 +0000
+@@ -255,7 +255,7 @@
+ int esparser_queue_eos(struct amvdec_core *core, const u8 *data, u32 len)
+ {
+ 	struct device *dev = core->dev;
+-	void *eos_vaddr;
++	u8 *eos_vaddr;
+ 	dma_addr_t eos_paddr;
+ 	int ret;
+ 
+@@ -265,6 +265,16 @@
+ 		return -ENOMEM;
+ 
+ 	memcpy(eos_vaddr, data, len);
++	/*
++	 * Like esparser_pad_start_code(): without a start code behind it the
++	 * parser keeps the EOS packet open and the end of sequence code only
++	 * sometimes reaches the VLD (MPEG-2 then never outputs its last
++	 * reference picture).
++	 */
++	eos_vaddr[len]     = 0x00;
++	eos_vaddr[len + 1] = 0x00;
++	eos_vaddr[len + 2] = 0x01;
++	eos_vaddr[len + 3] = 0xff;
+ 	ret = esparser_write_data(core, eos_paddr, len);
+ 	dma_free_coherent(dev, len + SEARCH_PATTERN_LEN,
+ 			  eos_vaddr, eos_paddr);
+@@ -418,6 +428,17 @@
+ 		schedule_delayed_work(&sess->drain_work,
+ 				      msecs_to_jiffies(VDEC_DRAIN_POLL_MS));
+ 	}
++
++	/* second EOS sequence requested by the drain watchdog */
++	if (sess->eos_resend && sess->eos_queued && !sess->last_sent) {
++		struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
++		const u8 *data;
++		u32 len;
++
++		data = codec_ops->eos_sequence(&len);
++		esparser_queue_eos(sess->core, data, len);
++	}
++	sess->eos_resend = 0;
+ 	mutex_unlock(&sess->lock);
+ }
+ 
+diff -urN a/drivers/staging/media/meson/vdec/vdec_1.c b/drivers/staging/media/meson/vdec/vdec_1.c
+--- a/drivers/staging/media/meson/vdec/vdec_1.c	2026-11-19 09:57:42.973234308 +0000
++++ b/drivers/staging/media/meson/vdec/vdec_1.c	2026-11-19 09:57:42.976766492 +0000
+@@ -251,6 +251,8 @@
+ 		amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+ 
+ 	/* Enable firmware processor */
++	if (core->platform->meson6)
++		amvdec_meson6_cpu_reset(core);
+ 	amvdec_write_dos(core, MPSR, 1);
+ 	/* Let the firmware settle */
+ 	usleep_range(10, 20);
+diff -urN a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+--- a/drivers/staging/media/meson/vdec/vdec.c	2026-11-19 09:57:42.977646831 +0000
++++ b/drivers/staging/media/meson/vdec/vdec.c	2026-11-19 09:57:42.980336058 +0000
+@@ -119,6 +119,8 @@
+ 	sess->eos_requested = 0;
+ 	sess->eos_queued = 0;
+ 	sess->last_sent = 0;
++	sess->eos_resent = 0;
++	sess->eos_resend = 0;
+ }
+ 
+ /*
+@@ -143,6 +145,20 @@
+ 	if (time_is_after_jiffies64(last + msecs_to_jiffies(VDEC_DRAIN_IDLE_MS)))
+ 		goto again;
+ 
++	/*
++	 * The Meson6 MPEG-2 firmware sometimes reads the end of sequence code
++	 * and still keeps its last reference picture; a second EOS sequence
++	 * gets it out. Try that once before giving up on the last picture.
++	 */
++	if (!sess->eos_resent && atomic_read(&sess->esparser_queued_bufs)) {
++		/* no sess->lock here: STREAMOFF cancels this work holding it */
++		sess->eos_resent = 1;
++		sess->eos_resend = 1;
++		sess->eos_jiffies = get_jiffies_64();
++		schedule_work(&sess->esparser_queue_work);
++		goto again;
++	}
++
+ 	vbuf = v4l2_m2m_dst_buf_remove(sess->m2m_ctx);
+ 	if (!vbuf)
+ 		goto again;
+diff -urN a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+--- a/drivers/staging/media/meson/vdec/vdec.h	2026-11-19 09:57:42.977708328 +0000
++++ b/drivers/staging/media/meson/vdec/vdec.h	2026-11-19 09:57:42.979968158 +0000
+@@ -271,6 +271,8 @@
+ 	unsigned int eos_requested;
+ 	unsigned int eos_queued;
+ 	unsigned int last_sent;
++	unsigned int eos_resent;
++	unsigned int eos_resend;
+ 	u64 eos_jiffies;
+ 	struct delayed_work drain_work;
+ 	unsigned int keyframe_found;
+diff -urN a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c	2026-11-19 09:57:42.973433748 +0000
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c	2026-11-19 09:57:42.976404721 +0000
+@@ -16,6 +16,7 @@
+ #include <media/videobuf2-dma-contig.h>
+ 
+ #include "vdec_helpers.h"
++#include "dos_regs.h"
+ 
+ #define NUM_CANVAS_NV12 2
+ #define NUM_CANVAS_YUV420 3
+@@ -591,6 +592,36 @@
+ }
+ EXPORT_SYMBOL_GPL(amvdec_src_change);
+ 
++/*
++ * Meson6, as the vendor amvdec_start()/amvdec_stop(): reset the firmware
++ * processors (VCPU, CCPU) around MPSR, with the CBUS dummy reads "for timing
++ * control". MPSR alone resumes the processor where it stopped.
++ */
++void amvdec_meson6_cpu_reset(struct amvdec_core *core)
++{
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_write_dos(core, DOS_SW_RESET0, BIT(12) | BIT(11));
++	amvdec_write_dos(core, DOS_SW_RESET0, 0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++}
++EXPORT_SYMBOL_GPL(amvdec_meson6_cpu_reset);
++
++void amvdec_meson6_cpu_stop(struct amvdec_core *core)
++{
++	int i = 10000;
++
++	amvdec_write_dos(core, MPSR, 0);
++	amvdec_write_dos(core, CPSR, 0);
++	while (--i && amvdec_read_dos(core, IMEM_DMA_CTRL) & 0x8000)
++		udelay(1);
++	amvdec_meson6_cpu_reset(core);
++}
++EXPORT_SYMBOL_GPL(amvdec_meson6_cpu_stop);
++
+ void amvdec_abort(struct amvdec_session *sess)
+ {
+ 	dev_info(sess->core->dev, "Aborting decoding session!\n");
+diff -urN a/drivers/staging/media/meson/vdec/vdec_helpers.h b/drivers/staging/media/meson/vdec/vdec_helpers.h
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.h	2026-11-19 09:57:42.973625962 +0000
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.h	2026-11-19 09:57:42.975558894 +0000
+@@ -89,4 +89,7 @@
+  * @sess: current session
+  */
+ void amvdec_abort(struct amvdec_session *sess);
++
++void amvdec_meson6_cpu_reset(struct amvdec_core *core);
++void amvdec_meson6_cpu_stop(struct amvdec_core *core);
+ #endif

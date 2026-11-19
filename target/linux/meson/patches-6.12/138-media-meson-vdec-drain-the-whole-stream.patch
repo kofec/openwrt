@@ -1,0 +1,251 @@
+From: kofec
+Subject: [PATCH] media: meson: vdec: drain the whole stream on V4L2_DEC_CMD_STOP
+
+For codecs ending the stream with an EOS sequence (MPEG-1/2, H.264) the
+STOP command wrote that sequence to the ESPARSER right away and set
+should_stop, which also makes esparser_queue_all_src() stop taking OUTPUT
+buffers. Buffers still queued at that point were never decoded (the end
+of the stream got cut: 36..73 of 73 pictures) and if the firmware didn't
+output a picture after the EOS sequence no CAPTURE buffer was ever
+flagged LAST, so clients blocked forever in the drain (FFmpeg
+*_v4l2m2m, at every end of file).
+
+Append the EOS sequence from esparser_queue_all_src() once the OUTPUT
+queue is empty and only then set should_stop. Add a watchdog that
+returns an empty LAST buffer (plus V4L2_EVENT_EOS) when the decoder has
+been idle for 300 ms after the EOS sequence without a LAST picture.
+DEC_CMD_START, STREAMON and STREAMOFF reset the drain state.
+
+diff -urN a/drivers/staging/media/meson/vdec/esparser.c b/drivers/staging/media/meson/vdec/esparser.c
+--- a/drivers/staging/media/meson/vdec/esparser.c	2026-11-19 07:34:08.927821494 +0000
++++ b/drivers/staging/media/meson/vdec/esparser.c	2026-11-19 07:34:08.930230514 +0000
+@@ -383,6 +383,29 @@
+ 		if (esparser_queue(sess, &buf->vb) < 0)
+ 			break;
+ 	}
++
++	/*
++	 * V4L2_DEC_CMD_STOP: the EOS sequence goes in once every OUTPUT buffer
++	 * queued before the command has been parsed, otherwise the end of the
++	 * stream would be cut off. should_stop is only set from here on, so
++	 * that dst_buf_done() flags the right picture as the last one.
++	 */
++	if (sess->eos_requested && !sess->eos_queued && !sess->should_stop &&
++	    !v4l2_m2m_num_src_bufs_ready(sess->m2m_ctx)) {
++		struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
++		const u8 *data;
++		u32 len;
++
++		data = codec_ops->eos_sequence(&len);
++		esparser_queue_eos(sess->core, data, len);
++		sess->eos_jiffies = get_jiffies_64();
++		sess->eos_queued = 1;
++		sess->should_stop = 1;
++		dev_dbg(sess->core->dev, "EOS queued, %d bufs pending\n",
++			atomic_read(&sess->esparser_queued_bufs));
++		schedule_delayed_work(&sess->drain_work,
++				      msecs_to_jiffies(VDEC_DRAIN_POLL_MS));
++	}
+ 	mutex_unlock(&sess->lock);
+ }
+ 
+diff -urN a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+--- a/drivers/staging/media/meson/vdec/vdec.c	2026-11-19 07:34:08.927754139 +0000
++++ b/drivers/staging/media/meson/vdec/vdec.c	2026-11-19 07:34:08.934511435 +0000
+@@ -23,6 +23,7 @@
+ #include "vdec.h"
+ #include "esparser.h"
+ #include "vdec_helpers.h"
++#include "dos_regs.h"
+ 
+ struct dummy_buf {
+ 	struct vb2_v4l2_buffer vb;
+@@ -104,6 +105,77 @@
+ 	return ret;
+ }
+ 
++static void vdec_reset_drain(struct amvdec_session *sess)
++{
++	cancel_delayed_work(&sess->drain_work);
++	sess->eos_requested = 0;
++	sess->eos_queued = 0;
++	sess->last_sent = 0;
++}
++
++/*
++ * After the EOS sequence the firmware normally outputs its last held
++ * picture, which dst_buf_done() flags as LAST. If it stays silent (nothing
++ * held, or a picture whose offset couldn't be matched), return an empty
++ * LAST buffer so that userspace waiting for the end of the drain doesn't
++ * block forever.
++ */
++static void vdec_drain_work(struct work_struct *work)
++{
++	struct amvdec_session *sess =
++		container_of(to_delayed_work(work), struct amvdec_session,
++			     drain_work);
++	const struct v4l2_event ev = { .type = V4L2_EVENT_EOS };
++	struct vb2_v4l2_buffer *vbuf;
++	u64 last = max(sess->last_irq_jiffies, sess->eos_jiffies);
++
++	if (!sess->eos_queued || sess->last_sent)
++		return;
++
++	if (time_is_after_jiffies64(last + msecs_to_jiffies(VDEC_DRAIN_IDLE_MS)))
++		goto again;
++
++	vbuf = v4l2_m2m_dst_buf_remove(sess->m2m_ctx);
++	if (!vbuf)
++		goto again;
++
++	dev_info(sess->core->dev_dec,
++		 "drain: no last picture after EOS (%d bufs pending), signaling EOS\n",
++		 atomic_read(&sess->esparser_queued_bufs));
++	if (atomic_read(&sess->esparser_queued_bufs) > 1) {
++		struct amvdec_core *core = sess->core;
++
++		dev_info(core->dev_dec,
++			 "drain: SCRATCH8..F %08x %08x %08x %08x %08x %08x %08x %08x MPSR %08x\n",
++			 amvdec_read_dos(core, AV_SCRATCH_8),
++			 amvdec_read_dos(core, AV_SCRATCH_9),
++			 amvdec_read_dos(core, AV_SCRATCH_A),
++			 amvdec_read_dos(core, AV_SCRATCH_B),
++			 amvdec_read_dos(core, AV_SCRATCH_C),
++			 amvdec_read_dos(core, AV_SCRATCH_D),
++			 amvdec_read_dos(core, AV_SCRATCH_E),
++			 amvdec_read_dos(core, AV_SCRATCH_F),
++			 amvdec_read_dos(core, MPSR));
++		dev_info(core->dev_dec,
++			 "drain: VIFIFO lvl %08x rp %08x wp %08x curr %08x ctrl %08x, dst ready %u (+1), recycle list %s\n",
++			 amvdec_read_dos(core, VLD_MEM_VIFIFO_LEVEL),
++			 amvdec_read_dos(core, VLD_MEM_VIFIFO_RP),
++			 amvdec_read_dos(core, VLD_MEM_VIFIFO_WP),
++			 amvdec_read_dos(core, VLD_MEM_VIFIFO_CURR_PTR),
++			 amvdec_read_dos(core, VLD_MEM_VIFIFO_CONTROL),
++			 v4l2_m2m_num_dst_bufs_ready(sess->m2m_ctx),
++			 list_empty(&sess->bufs_recycle) ? "empty" : "NOT empty");
++	}
++	sess->last_sent = 1;
++	v4l2_event_queue_fh(&sess->fh, &ev);
++	v4l2_m2m_last_buffer_done(sess->m2m_ctx, vbuf);
++	return;
++
++again:
++	schedule_delayed_work(&sess->drain_work,
++			      msecs_to_jiffies(VDEC_DRAIN_POLL_MS));
++}
++
+ static void vdec_wait_inactive(struct amvdec_session *sess)
+ {
+ 	/* We consider 50ms with no IRQ to be inactive. */
+@@ -332,6 +404,7 @@
+ 	}
+ 
+ 	sess->should_stop = 0;
++	vdec_reset_drain(sess);
+ 	sess->keyframe_found = 0;
+ 	sess->last_offset = 0;
+ 	sess->wrap_count = 0;
+@@ -410,6 +483,9 @@
+ 	struct amvdec_core *core = sess->core;
+ 	struct vb2_v4l2_buffer *buf;
+ 
++	cancel_delayed_work_sync(&sess->drain_work);
++	vdec_reset_drain(sess);
++
+ 	if (sess->status == STATUS_RUNNING ||
+ 	    sess->status == STATUS_INIT ||
+ 	    (sess->status == STATUS_NEEDS_RESUME &&
+@@ -741,6 +817,8 @@
+ 	if (cmd->cmd == V4L2_DEC_CMD_START) {
+ 		v4l2_m2m_clear_state(sess->m2m_ctx);
+ 		sess->should_stop = 0;
++		vdec_reset_drain(sess);
++		schedule_work(&sess->esparser_queue_work);
+ 		return 0;
+ 	}
+ 
+@@ -750,19 +828,18 @@
+ 
+ 	dev_dbg(dev, "Received V4L2_DEC_CMD_STOP\n");
+ 
+-	sess->should_stop = 1;
+-
+ 	v4l2_m2m_mark_stopped(sess->m2m_ctx);
+ 
+ 	if (codec_ops->drain) {
++		sess->should_stop = 1;
+ 		vdec_wait_inactive(sess);
+ 		codec_ops->drain(sess);
+ 	} else if (codec_ops->eos_sequence) {
+-		u32 len;
+-		const u8 *data = codec_ops->eos_sequence(&len);
+-
+-		esparser_queue_eos(sess->core, data, len);
+-		vdec_wait_inactive(sess);
++		/* esparser_queue_all_src() appends EOS after the last buffer */
++		sess->eos_requested = 1;
++		schedule_work(&sess->esparser_queue_work);
++	} else {
++		sess->should_stop = 1;
+ 	}
+ 
+ 	return ret;
+@@ -929,6 +1006,7 @@
+ 	INIT_LIST_HEAD(&sess->timestamps);
+ 	INIT_LIST_HEAD(&sess->bufs_recycle);
+ 	INIT_WORK(&sess->esparser_queue_work, esparser_queue_all_src);
++	INIT_DELAYED_WORK(&sess->drain_work, vdec_drain_work);
+ 	mutex_init(&sess->lock);
+ 	mutex_init(&sess->bufs_recycle_lock);
+ 	spin_lock_init(&sess->ts_spinlock);
+diff -urN a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+--- a/drivers/staging/media/meson/vdec/vdec.h	2026-11-19 07:34:08.927669169 +0000
++++ b/drivers/staging/media/meson/vdec/vdec.h	2026-11-19 07:34:08.935008921 +0000
+@@ -206,6 +206,13 @@
+  * @sequence_out: output sequence counter
+  * @should_stop: flag set if userspace signaled EOS via command
+  *		 or empty buffer
++ * @eos_requested: V4L2_DEC_CMD_STOP received, EOS sequence still to be
++ *		   appended after the remaining OUTPUT buffers
++ * @eos_queued: EOS sequence written to the ESPARSER
++ * @last_sent: a CAPTURE buffer with V4L2_BUF_FLAG_LAST has been returned
++ * @eos_jiffies: time the EOS sequence was written
++ * @drain_work: watchdog returning an empty LAST buffer if the firmware
++ *		doesn't output a final picture after the EOS sequence
+  * @keyframe_found: flag set once a keyframe has been parsed
+  * @num_dst_bufs: number of destination buffers
+  * @changed_format: the format changed
+@@ -226,6 +233,9 @@
+  * @status: current decoding status
+  * @priv: codec private data
+  */
++#define VDEC_DRAIN_POLL_MS	100
++#define VDEC_DRAIN_IDLE_MS	300
++
+ struct amvdec_session {
+ 	struct amvdec_core *core;
+ 
+@@ -255,6 +265,11 @@
+ 	unsigned int streamon_cap, streamon_out;
+ 	unsigned int sequence_cap, sequence_out;
+ 	unsigned int should_stop;
++	unsigned int eos_requested;
++	unsigned int eos_queued;
++	unsigned int last_sent;
++	u64 eos_jiffies;
++	struct delayed_work drain_work;
+ 	unsigned int keyframe_found;
+ 	unsigned int num_dst_bufs;
+ 	unsigned int changed_format;
+diff -urN a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c	2026-11-19 07:34:08.927880463 +0000
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c	2026-11-19 07:34:08.929710885 +0000
+@@ -420,6 +420,7 @@
+ 			sess->sequence_cap - 1);
+ 		v4l2_event_queue_fh(&sess->fh, &ev);
+ 		vbuf->flags |= V4L2_BUF_FLAG_LAST;
++		sess->last_sent = 1;
+ 	} else if (sess->status == STATUS_NEEDS_RESUME) {
+ 		/* Mark LAST for drained show frames during a source change */
+ 		vbuf->flags |= V4L2_BUF_FLAG_LAST;

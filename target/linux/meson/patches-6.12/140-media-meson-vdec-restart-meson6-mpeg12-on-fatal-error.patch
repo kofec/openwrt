@@ -1,0 +1,158 @@
+From: kofec
+Subject: [PATCH] media: meson: vdec: restart the Meson6 MPEG-1/2 firmware on fatal errors
+
+Under memory load (Kodi on screen) the Meson6 MPEG-1/2 firmware now and
+then sets MREG_FATAL_ERROR in the middle of a clean stream - without an
+interrupt - and stops decoding: 26..41 of 73 pictures, the rest of the
+stream left in the VIFIFO.
+
+Do what the vendor driver does every 10 ms (vmpeg_put_timer_func()):
+check the register from the recycle thread and restart the firmware in
+place - stop, DOS_SW_RESET0 bits 7/6/4, canvases and MREG_* setup as in
+start, run - so that decoding resumes from the current VIFIFO position.
+The canvas registers are saved at start since the firmware reuses
+AV_SCRATCH_4..7 for picture information.
+
+diff -urN a/drivers/staging/media/meson/vdec/codec_mpeg12.c b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+--- a/drivers/staging/media/meson/vdec/codec_mpeg12.c	2026-11-19 08:51:08.341931505 +0000
++++ b/drivers/staging/media/meson/vdec/codec_mpeg12.c	2026-11-19 08:51:08.356044082 +0000
+@@ -40,6 +40,9 @@
+ 	/* Buffer for the MPEG1/2 Workspace */
+ 	void	  *workspace_vaddr;
+ 	dma_addr_t workspace_paddr;
++	/* Meson6: canvas registers, the firmware reuses AV_SCRATCH_4..7 */
++	u32 canvas_reg[8];
++	unsigned int resets;
+ };
+ 
+ static const u8 eos_sequence[SZ_1K] = { 0x00, 0x00, 0x01, 0xB7 };
+@@ -64,7 +67,7 @@
+ {
+ 	struct amvdec_core *core = sess->core;
+ 	struct codec_mpeg12 *mpeg12;
+-	int ret;
++	int ret, i;
+ 
+ 	mpeg12 = kzalloc(sizeof(*mpeg12), GFP_KERNEL);
+ 	if (!mpeg12)
+@@ -85,6 +88,10 @@
+ 	if (ret)
+ 		goto free_workspace;
+ 
++	for (i = 0; i < ARRAY_SIZE(mpeg12->canvas_reg); i++)
++		mpeg12->canvas_reg[i] = amvdec_read_dos(core,
++							AV_SCRATCH_0 + i * 4);
++
+ 	amvdec_write_dos(core, POWER_CTL_VLD, BIT(4));
+ 	amvdec_write_dos(core, MREG_CO_MV_START,
+ 			 mpeg12->workspace_paddr + WORKSPACE_OFFSET);
+@@ -199,6 +206,64 @@
+ 	return IRQ_WAKE_THREAD;
+ }
+ 
++/*
++ * Meson6: the firmware sets MREG_FATAL_ERROR without raising an interrupt
++ * and then stops decoding for good. The vendor driver polls the register
++ * every 10 ms and restarts the firmware in place (vmpeg_put_timer_func(),
++ * vmpeg12_prot_init()); decoding resumes from the current VIFIFO position.
++ */
++static bool codec_mpeg12_watchdog(struct amvdec_session *sess)
++{
++	struct amvdec_core *core = sess->core;
++	struct codec_mpeg12 *mpeg12 = sess->priv;
++	u32 vld;
++	int i;
++
++	if (!core->platform->meson6 || !mpeg12 ||
++	    sess->status == STATUS_STOPPED ||
++	    amvdec_read_dos(core, MREG_FATAL_ERROR) != 1)
++		return false;
++
++	mpeg12->resets++;
++	dev_warn_ratelimited(core->dev_dec,
++			     "MPEG1/2 firmware fatal error, restarting it (%u)\n",
++			     mpeg12->resets);
++
++	amvdec_write_dos(core, ASSIST_MBOX1_MASK, 0);
++	amvdec_write_dos(core, MPSR, 0);
++	amvdec_write_dos(core, CPSR, 0);
++
++	vld = amvdec_read_dos(core, POWER_CTL_VLD);
++	amvdec_write_dos(core, DOS_SW_RESET0, BIT(7) | BIT(6) | BIT(4));
++	amvdec_write_dos(core, DOS_SW_RESET0, 0);
++	amvdec_write_dos(core, POWER_CTL_VLD, vld);
++
++	for (i = 0; i < ARRAY_SIZE(mpeg12->canvas_reg); i++)
++		amvdec_write_dos(core, AV_SCRATCH_0 + i * 4,
++				 mpeg12->canvas_reg[i]);
++	amvdec_write_dos(core, MREG_CO_MV_START,
++			 mpeg12->workspace_paddr + WORKSPACE_OFFSET);
++
++	amvdec_write_dos(core, MPEG1_2_REG, 0);
++	amvdec_write_dos(core, PSCALE_CTRL, 0);
++	amvdec_write_dos(core, PIC_HEAD_INFO, 0x380);
++	amvdec_write_dos(core, M4_CONTROL_REG, 0);
++	amvdec_write_dos(core, ASSIST_MBOX1_CLR_REG, 1);
++	amvdec_write_dos(core, MREG_BUFFERIN, 0);
++	amvdec_write_dos(core, MREG_BUFFEROUT, 0);
++	amvdec_write_dos(core, MREG_CMD, (sess->width << 16) | sess->height);
++	amvdec_write_dos(core, MREG_ERROR_COUNT, 0);
++	amvdec_write_dos(core, MREG_FATAL_ERROR, 0);
++	amvdec_write_dos(core, MREG_WAIT_BUFFER, 0);
++	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M)
++		amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
++
++	amvdec_write_dos(core, ASSIST_MBOX1_MASK, 1);
++	amvdec_write_dos(core, MPSR, 1);
++
++	return true;
++}
++
+ struct amvdec_codec_ops codec_mpeg12_ops = {
+ 	.start = codec_mpeg12_start,
+ 	.stop = codec_mpeg12_stop,
+@@ -206,5 +271,6 @@
+ 	.threaded_isr = codec_mpeg12_threaded_isr,
+ 	.can_recycle = codec_mpeg12_can_recycle,
+ 	.recycle = codec_mpeg12_recycle,
++	.watchdog = codec_mpeg12_watchdog,
+ 	.eos_sequence = codec_mpeg12_eos_sequence,
+ };
+diff -urN a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+--- a/drivers/staging/media/meson/vdec/vdec.c	2026-11-19 08:51:08.341332385 +0000
++++ b/drivers/staging/media/meson/vdec/vdec.c	2026-11-19 08:51:08.349723015 +0000
+@@ -60,6 +60,14 @@
+ 
+ 	while (!kthread_should_stop()) {
+ 		mutex_lock(&sess->bufs_recycle_lock);
++		if (codec_ops->watchdog && codec_ops->watchdog(sess)) {
++			/* the restarted firmware considers every buffer free */
++			list_for_each_entry_safe(tmp, n, &sess->bufs_recycle,
++						 list) {
++				list_del(&tmp->list);
++				kfree(tmp);
++			}
++		}
+ 		list_for_each_entry_safe(tmp, n, &sess->bufs_recycle, list) {
+ 			if (!codec_ops->can_recycle(core))
+ 				break;
+diff -urN a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+--- a/drivers/staging/media/meson/vdec/vdec.h	2026-11-19 08:51:08.340902097 +0000
++++ b/drivers/staging/media/meson/vdec/vdec.h	2026-11-19 08:51:08.347014472 +0000
+@@ -120,6 +120,8 @@
+  *		 a dst buffer
+  * @recycle: optional call to tell the codec to recycle a dst buffer. Must go
+  *	     in pair with @can_recycle
++ * @watchdog: optional, called every 5-10 ms from the recycle thread; returns
++ *	      true if it reset the firmware (pending recycles are dropped)
+  * @drain: optional call if the codec has a custom way of draining
+  * @resume: optional call to resume after a resolution change
+  * @eos_sequence: optional call to get an end sequence to send to esparser
+@@ -135,6 +137,7 @@
+ 	u32 (*num_pending_bufs)(struct amvdec_session *sess);
+ 	int (*can_recycle)(struct amvdec_core *core);
+ 	void (*recycle)(struct amvdec_core *core, u32 buf_idx);
++	bool (*watchdog)(struct amvdec_session *sess);
+ 	void (*drain)(struct amvdec_session *sess);
+ 	void (*resume)(struct amvdec_session *sess);
+ 	const u8 * (*eos_sequence)(u32 *len);
