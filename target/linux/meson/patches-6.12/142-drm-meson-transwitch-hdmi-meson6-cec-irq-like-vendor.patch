@@ -1,0 +1,85 @@
+From: kofec
+Subject: [PATCH] drm/meson: transwitch-hdmi: Meson6 CEC interrupt like the vendor driver
+
+With libcec (Kodi) using the adapter the CEC interrupt fired ~72000
+times per second from boot on, keeping CPU0 busy in the RT irq thread
+(RCU stalls, load 27, the box running hot). The handler toggled
+CEC_RX_CLEAR_BUF on every interrupt, which the vendor cec_ll_rx() never
+does; it only acknowledges (RX_ACK_CURRENT, RX_NO_OP), after a 100 us
+delay in cec_isr_handler().
+
+Do the same, and throttle the thread if more than 500 interrupts arrive
+within a second so that a storm can't take a CPU down again.
+
+diff -urN a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c
+--- a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c	2026-11-19 10:44:00.280128578 +0000
++++ b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c	2026-11-19 10:44:00.280963635 +0000
+@@ -61,6 +61,8 @@
+ 	struct cec_adapter		*cec_adap;
+ 	struct delayed_work		cec_tx_work;
+ 	unsigned long			cec_tx_deadline;
++	unsigned long			cec_irq_window;
++	unsigned int			cec_irq_count;
+ 	bool				cec_tx_pending;
+ 
+ 	struct drm_bridge		bridge;
+@@ -1009,30 +1011,48 @@
+ 	struct cec_msg msg = {};
+ 	unsigned int i;
+ 
++	/*
++	 * Safety net: an interrupt storm (seen at ~72000/s) must not keep a
++	 * CPU busy in this RT thread forever.
++	 */
++	if (time_after(jiffies, priv->cec_irq_window + HZ)) {
++		priv->cec_irq_window = jiffies;
++		priv->cec_irq_count = 0;
++	}
++	if (++priv->cec_irq_count > 500) {
++		pr_warn_ratelimited("meson6-hdmi-cec: interrupt storm, throttling\n");
++		msleep(20);
++	}
++
++	/* vendor cec_isr_handler(): "fixes CEC stopping after a while" */
++	udelay(100);
++
+ 	if (priv->cec_tx_pending)
+ 		mod_delayed_work(system_wq, &priv->cec_tx_work, 0);
+ 
+-	if (meson_txc_cec_read(priv, CEC_RX_MSG_STATUS) != CEC_RX_DONE)
+-		goto out;
+-
+-	if (meson_txc_cec_read(priv, CEC_RX_NUM_MSG) != 1)
+-		goto out;
++	/*
++	 * As the vendor cec_ll_rx(): acknowledge only. Toggling
++	 * CEC_RX_CLEAR_BUF here raised the next interrupt, the thread kept
++	 * re-triggering itself.
++	 */
++	if (meson_txc_cec_read(priv, CEC_RX_MSG_STATUS) != CEC_RX_DONE ||
++	    meson_txc_cec_read(priv, CEC_RX_NUM_MSG) != 1) {
++		meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_ACK_CURRENT);
++		meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
++		return IRQ_HANDLED;
++	}
+ 
+ 	msg.len = meson_txc_cec_read(priv, CEC_RX_MSG_LENGTH) + 1;
+ 	if (msg.len > CEC_MAX_MSG_SIZE)
+ 		msg.len = CEC_MAX_MSG_SIZE;
+ 
++	meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_ACK_CURRENT);
+ 	for (i = 0; i < msg.len; i++)
+ 		msg.msg[i] = meson_txc_cec_read(priv, CEC_RX_MSG_0_HEADER + i);
++	meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
+ 
+ 	cec_received_msg(priv->cec_adap, &msg);
+ 
+-out:
+-	meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_ACK_CURRENT);
+-	meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
+-	meson_txc_cec_write(priv, CEC_RX_CLEAR_BUF, 1);
+-	meson_txc_cec_write(priv, CEC_RX_CLEAR_BUF, 0);
+-
+ 	return IRQ_HANDLED;
+ }
+ 
