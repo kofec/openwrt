@@ -1,0 +1,190 @@
+From: kofec
+Subject: [PATCH] media: meson: vdec: add Meson6 H.264 support
+
+The Meson6 H.264 microcode of the vendor kernel (m6/ucode/h264) uses the
+same AV_SCRATCH mailbox protocol as the GXBB firmware: a 16 KB main
+program loaded to IMEM and five 4 KB segments (header, data, mmco, list,
+slice) the firmware swaps in itself by DMA from the buffer at
+AV_SCRATCH_G, the workspace offset of 0x1000000 in AV_SCRATCH_1, frame
+status in AV_SCRATCH_1.., bitstream offsets in AV_SCRATCH_A..C, recycling
+through AV_SCRATCH_7/8. meson6_h264.bin is built like gxbb_h264.bin.
+
+Differences taken from the vendor vh264_prot_init() for M6:
+- reset IQIDCT/MC/VLD (DOS_SW_RESET0 bits 7, 6, 4) and picture DC/DBLK
+  (bits 9, 8) after waiting for the DCAC/LMEM DMA, PSCALE off, scratch
+  registers 0, 7, 8, 9 and J cleared;
+- AV_SCRATCH_F: only bit 4 (error recovery), no bit 7;
+- no MDEC_PIC_DC_THRESH (vendor writes it from Meson8 on).
+
+The vendor vdec probe leaves the Meson6 VDEC clock at 250 MHz
+(vdec_clock_hi_enable(), fclk_div2 / 4); 200 MHz is only the
+vdec_clock_enable() level it starts from. Use 250 MHz like the vendor.
+
+Command 3 (stream switch, new SPS mid-stream) is acknowledged after
+clearing the recycle registers like the vendor stream_switching_done();
+the firmware follows with CMD_SRC_CHANGE. Commands 4/5 (slice groups,
+reserved) are ignored silently.
+
+--- a/drivers/staging/media/meson/vdec/codec_h264.c	2026-11-19 16:46:56.891016600 +0100
++++ b/drivers/staging/media/meson/vdec/codec_h264.c	2026-11-19 16:47:43.270573400 +0100
+@@ -4,6 +4,7 @@
+  * Author: Maxime Jourdan <mjourdan@baylibre.com>
+  */
+ 
++#include <linux/delay.h>
+ #include <media/v4l2-mem2mem.h>
+ #include <media/videobuf2-dma-contig.h>
+ 
+@@ -25,6 +26,7 @@
+ #define CMD_MASK		GENMASK(7, 0)
+ #define CMD_SRC_CHANGE		1
+ #define CMD_FRAMES_READY	2
++#define CMD_SWITCH_STREAM	3
+ #define CMD_FATAL_ERROR		6
+ #define CMD_BAD_WIDTH		7
+ #define CMD_BAD_HEIGHT		8
+@@ -163,6 +165,45 @@
+ 		amvdec_write_dos(core, AV_SCRATCH_8, buf_idx + 1);
+ }
+ 
++/*
++ * Meson6, as the vendor vh264_prot_init(): wait for the DCAC/LMEM DMA,
++ * reset the IQIDCT/MC/VLD parts (bits 7, 6, 4) twice and the picture
++ * DC/deblocking blocks (bits 9, 8), with the dummy reads in between, and
++ * clear the scratch registers the firmware polls on start.
++ */
++static void codec_h264_meson6_reset(struct amvdec_core *core)
++{
++	int i = 10000;
++
++	while (--i && (amvdec_read_dos(core, DCAC_DMA_CTRL) & 0x8000))
++		udelay(1);
++	i = 10000;
++	while (--i && (amvdec_read_dos(core, LMEM_DMA_CTRL) & 0x8000))
++		udelay(1);
++
++	amvdec_write_dos(core, DOS_SW_RESET0, BIT(7) | BIT(6) | BIT(4));
++	amvdec_write_dos(core, DOS_SW_RESET0, 0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_write_dos(core, DOS_SW_RESET0, BIT(7) | BIT(6) | BIT(4));
++	amvdec_write_dos(core, DOS_SW_RESET0, 0);
++	amvdec_write_dos(core, DOS_SW_RESET0, BIT(9) | BIT(8));
++	amvdec_write_dos(core, DOS_SW_RESET0, 0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++
++	/* disable PSCALE for hardware sharing */
++	amvdec_write_dos(core, PSCALE_CTRL, 0);
++
++	amvdec_write_dos(core, AV_SCRATCH_0, 0);
++	amvdec_write_dos(core, AV_SCRATCH_7, 0);
++	amvdec_write_dos(core, AV_SCRATCH_8, 0);
++	amvdec_write_dos(core, AV_SCRATCH_9, 0);
++	amvdec_write_dos(core, AV_SCRATCH_J, 0);
++}
++
+ static int codec_h264_start(struct amvdec_session *sess)
+ {
+ 	u32 workspace_offset;
+@@ -182,6 +223,9 @@
+ 	if (!h264->sei_vaddr)
+ 		return -ENOMEM;
+ 
++	if (core->platform->meson6)
++		codec_h264_meson6_reset(core);
++
+ 	amvdec_write_dos_bits(core, POWER_CTL_VLD, BIT(9) | BIT(6));
+ 
+ 	workspace_offset = h264->workspace_paddr - WORKSPACE_BUF_OFFSET;
+@@ -190,6 +234,18 @@
+ 	amvdec_write_dos(core, AV_SCRATCH_I, h264->sei_paddr -
+ 					     workspace_offset);
+ 
++	if (core->platform->meson6) {
++		/*
++		 * vh264_prot_init() for M6: bit 4 = error recovery mode 1
++		 * (vendor default 3), no bit 7, and MDEC_PIC_DC_THRESH only
++		 * from Meson8 on.
++		 */
++		amvdec_write_dos(core, AV_SCRATCH_F,
++				 (amvdec_read_dos(core, AV_SCRATCH_F) &
++				  0xffffff83) | BIT(4));
++		return 0;
++	}
++
+ 	/* Enable "error correction" */
+ 	amvdec_write_dos(core, AV_SCRATCH_F,
+ 			 (amvdec_read_dos(core, AV_SCRATCH_F) & 0xffffffc3) |
+@@ -442,7 +498,21 @@
+ 		size = (amvdec_read_dos(core, AV_SCRATCH_1) + 1) * 16;
+ 		dev_err(core->dev, "Unsupported video height: %u\n", size);
+ 		goto abort;
++	case CMD_SWITCH_STREAM:
++		/*
++		 * Meson6 firmware: new sequence parameters in the middle of
++		 * the stream. The vendor driver waits for all pictures back,
++		 * clears the recycle registers and acks; the firmware then
++		 * sends CMD_SRC_CHANGE, handled through V4L2 source change.
++		 */
++		dev_dbg(core->dev, "H.264 stream switch\n");
++		amvdec_write_dos(core, AV_SCRATCH_7, 0);
++		amvdec_write_dos(core, AV_SCRATCH_8, 0);
++		amvdec_write_dos(core, AV_SCRATCH_9, 0);
++		break;
+ 	case 0: /* Unused but not worth printing for */
++	case 4: /* Meson6: reserved for slice groups */
++	case 5:
+ 	case 9:
+ 		break;
+ 	default:
+--- a/drivers/staging/media/meson/vdec/vdec_platform.c	2026-11-19 16:46:57.023424900 +0100
++++ b/drivers/staging/media/meson/vdec/vdec_platform.c	2026-11-19 16:47:04.605299100 +0100
+@@ -17,9 +17,27 @@
+  * Meson6: the MPEG-1/2 microcode of the vendor kernel
+  * (drivers/amlogic/amports/m6/ucode/mpeg12/vmpeg12_mc.c) uses the same
+  * mailbox protocol as the GXL firmware.
++ *
++ * The H.264 microcode (m6/ucode/h264) talks the same AV_SCRATCH protocol as
++ * the GXBB one: 16 KB main program in IMEM plus five 4 KB segments (header,
++ * data, mmco, list, slice) it swaps in itself by DMA from AV_SCRATCH_G.
++ * meson6_h264.bin is laid out like gxbb_h264.bin: main program, then the
++ * segments in that order.
+  */
+ static const struct amvdec_format vdec_formats_meson6[] = {
+ 	{
++		.pixfmt = V4L2_PIX_FMT_H264,
++		.min_buffers = 2,
++		.max_buffers = 24,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_h264_ops,
++		.firmware_path = "meson/vdec/meson6_h264.bin",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.flags = V4L2_FMT_FLAG_COMPRESSED |
++			 V4L2_FMT_FLAG_DYN_RESOLUTION,
++	}, {
+ 		.pixfmt = V4L2_PIX_FMT_MPEG1,
+ 		.min_buffers = 8,
+ 		.max_buffers = 8,
+--- a/drivers/staging/media/meson/vdec/vdec_1.c	2026-11-19 17:03:25.404193900 +0100
++++ b/drivers/staging/media/meson/vdec/vdec_1.c	2026-11-19 17:03:30.500531000 +0100
+@@ -184,9 +184,13 @@
+ 	struct amvdec_core *core = sess->core;
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 
+-	/* Configure the vdec clk to the maximum available */
++	/*
++	 * Configure the vdec clk to the maximum available. Meson6: 250 MHz
++	 * (fclk_div2 / 4), the vendor vdec probe default (vdec_clock_hi_enable()
++	 * below MESON6TVD); 200 MHz is only its vdec_clock_enable() level.
++	 */
+ 	clk_set_rate(core->vdec_1_clk,
+-		     core->platform->meson6 ? 200000000 : 666666666);
++		     core->platform->meson6 ? 250000000 : 666666666);
+ 	ret = clk_prepare_enable(core->vdec_1_clk);
+ 	if (ret)
+ 		return ret;

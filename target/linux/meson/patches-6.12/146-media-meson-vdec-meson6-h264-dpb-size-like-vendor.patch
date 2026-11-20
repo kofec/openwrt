@@ -1,0 +1,91 @@
+From: kofec
+Subject: [PATCH] media: meson: vdec: Meson6 H.264 DPB size like the vendor
+
+Mainline answers the H.264 parameter request with
+(max_refs << 24) | (num_dst_bufs << 16) | ((max_refs - 1) << 8).
+The vendor vh264_set_params() fills the low field with max_dpb_size,
+taken from level_idc (AV_SCRATCH_A at that moment) and the aligned
+picture size by get_max_dpb_size(), and keeps
+max_reference <= max_dpb <= actual_dpb (at most 24). Do the same on
+Meson6.
+
+--- a/drivers/staging/media/meson/vdec/codec_h264.c	2026-11-19 21:22:57.519683500 +0100
++++ b/drivers/staging/media/meson/vdec/codec_h264.c	2026-11-19 21:36:28.729652200 +0100
+@@ -145,8 +145,38 @@
+ 	u32 mb_width;
+ 	u32 mb_height;
+ 	u32 max_refs;
++	/* Meson6: level_idc from AV_SCRATCH_A at the source change */
++	u32 level_idc;
+ };
+ 
++/*
++ * Meson6, vendor get_max_dpb_size(): DPB size in frames from the level's
++ * MaxDpbMbs-like table (bytes / 1024) and the aligned picture size, at
++ * most 16; 0 for an unknown level.
++ */
++static u32 codec_h264_meson6_max_dpb(u32 level_idc, u32 mb_width,
++				     u32 mb_height)
++{
++	u32 r, size;
++
++	switch (level_idc) {
++	case 10: r = 1485; break;
++	case 11: r = 3375; break;
++	case 12: case 13: case 20: r = 8910; break;
++	case 21: r = 17820; break;
++	case 22: case 30: r = 30375; break;
++	case 31: r = 67500; break;
++	case 32: r = 76800; break;
++	case 40: case 41: case 42: r = 122880; break;
++	case 50: r = 414000; break;
++	case 51: case 52: r = 691200; break;
++	default: return 0;
++	}
++
++	size = (mb_width * mb_height + mb_width * mb_height / 2) * 256 * 10;
++	return min_t(u32, DIV_ROUND_UP(r * 1024, size), 16);
++}
++
+ static int codec_h264_can_recycle(struct amvdec_core *core)
+ {
+ 	return !amvdec_read_dos(core, AV_SCRATCH_7) ||
+@@ -369,6 +399,29 @@
+ 	/* End of ref MV */
+ 	amvdec_write_dos(core, AV_SCRATCH_4, h264->ref_paddr + h264->ref_size);
+ 
++	if (core->platform->meson6) {
++		/*
++		 * vh264_set_params(): max_reference <= max_dpb <= actual_dpb,
++		 * max_dpb from the level (mainline passes max_refs - 1, which
++		 * the M6 firmware takes as the reorder depth).
++		 */
++		u32 actual = min_t(u32, sess->num_dst_bufs, 24);
++		u32 refs = min(h264->max_refs - 1, actual - 1);
++		u32 dpb = codec_h264_meson6_max_dpb(h264->level_idc,
++						    mb_width, mb_height);
++
++		dpb = dpb ? min(dpb, actual) : actual;
++		dpb = max(refs, dpb);
++		dev_info(core->dev,
++			 "H.264 %ux%u MB level %u: refs %u dpb %u actual %u\n",
++			 mb_width, mb_height, h264->level_idc, refs + 1, dpb,
++			 actual);
++		amvdec_write_dos(core, AV_SCRATCH_0, ((refs + 1) << 24) |
++						     (actual << 16) |
++						     (dpb << 8));
++		return;
++	}
++
+ 	amvdec_write_dos(core, AV_SCRATCH_0, (h264->max_refs << 24) |
+ 					     (sess->num_dst_bufs << 16) |
+ 					     ((h264->max_refs - 1) << 8));
+@@ -397,6 +450,8 @@
+ 	h264->mb_height = mb_total / h264->mb_width;
+ 
+ 	h264->max_refs = ((parsed_info >> MAX_REF_BIT) & MAX_REF_MASK) + 1;
++	if (core->platform->meson6)
++		h264->level_idc = amvdec_read_dos(core, AV_SCRATCH_A);
+ 
+ 	crop_infor = amvdec_read_dos(core, AV_SCRATCH_6);
+ 	crop_bottom = (crop_infor & 0xff);
