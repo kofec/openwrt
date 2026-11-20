@@ -1,0 +1,90 @@
+From: kofec
+Subject: [PATCH] drm/meson: transwitch-hdmi: Meson6 CEC, accept a TX result only after BUSY
+
+Patch 143 reads the transmit status only after the frame time (vendor
+cec_ll_tx_polling()). The register keeps DONE/ERROR of the previous
+frame until the new one actually starts, and the start is delayed while
+the bus is busy - the TV sends a lot when the box boots. A stale DONE
+still made logical address polls look acknowledged: on 2026-11-19 the
+kernel ended up with LA 9 (the TV showed "Recorder 3") while libcec kept
+transmitting as LA 1, so CEC did not work at all.
+
+Poll the status every 2 ms from the request on, remember whether this
+frame was seen BUSY, and accept DONE/ERROR only for such a frame and not
+before the frame time. A frame never seen on the bus is aborted at the
+2 s deadline and reported as an error, so the CEC core retries it.
+
+--- a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c	2026-11-19 22:13:06.068575300 +0100
++++ b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c	2026-11-19 22:13:21.361993300 +0100
+@@ -65,6 +65,7 @@
+ 	unsigned long			cec_irq_window;
+ 	unsigned int			cec_irq_count;
+ 	bool				cec_tx_pending;
++	bool				cec_tx_seen_busy;
+ 
+ 	struct drm_bridge		bridge;
+ 	struct drm_bridge		*next_bridge;
+@@ -962,6 +963,7 @@
+ 	meson_txc_cec_write(priv, CEC_TX_MSG_CMD, CEC_TX_REQ_CURRENT);
+ 
+ 	priv->cec_tx_pending = true;
++	priv->cec_tx_seen_busy = false;
+ 	/*
+ 	 * vendor cec_ll_tx_polling(): the status only means something after
+ 	 * the frame could have been sent, len * 24 + 5 ms
+@@ -986,36 +988,31 @@
+ 		return;
+ 
+ 	/*
+-	 * Any CEC interrupt (e.g. the TV talking) kicks this work at once;
+-	 * reading the status that early can return the previous frame's
+-	 * result. A poll message "acknowledged" that way made the kernel
+-	 * skip a free logical address while libcec kept using it.
++	 * The status register keeps DONE/ERROR of the previous frame until
++	 * this one actually starts, and it starts late when the bus is busy
++	 * (the TV talks a lot at boot). Reading it after the frame time alone
++	 * still saw a stale DONE: logical address polls looked acknowledged
++	 * and the kernel took LA 9 ("Recorder 3" on the TV) while libcec sent
++	 * as 1. Poll from the start and only accept a result for a frame that
++	 * was seen BUSY, and not before the frame could have been sent.
+ 	 */
+-	if (time_before(jiffies, priv->cec_tx_min)) {
++	stat = meson_txc_cec_read(priv, CEC_TX_MSG_STATUS);
++	if (stat == CEC_TX_BUSY)
++		priv->cec_tx_seen_busy = true;
++
++	if ((stat == CEC_TX_DONE || stat == CEC_TX_ERROR) &&
++	    priv->cec_tx_seen_busy && !time_before(jiffies, priv->cec_tx_min)) {
++		tx_status = stat == CEC_TX_DONE ? CEC_TX_STATUS_OK :
++						  CEC_TX_STATUS_NACK;
++	} else if (time_before(jiffies, priv->cec_tx_deadline)) {
+ 		schedule_delayed_work(&priv->cec_tx_work,
+-				      priv->cec_tx_min - jiffies);
++				      msecs_to_jiffies(CEC_TX_POLL_MS));
+ 		return;
+-	}
+-
+-	stat = meson_txc_cec_read(priv, CEC_TX_MSG_STATUS);
+-	switch (stat) {
+-	case CEC_TX_DONE:
+-		tx_status = CEC_TX_STATUS_OK;
+-		break;
+-	case CEC_TX_ERROR:
+-		tx_status = CEC_TX_STATUS_NACK;
+-		break;
+-	default:
+-		/* still idle (not started) or busy */
+-		if (time_before(jiffies, priv->cec_tx_deadline)) {
+-			schedule_delayed_work(&priv->cec_tx_work,
+-					      msecs_to_jiffies(CEC_TX_POLL_MS));
+-			return;
+-		}
++	} else {
++		/* never seen on the bus: let the CEC core retry */
+ 		meson_txc_cec_write(priv, CEC_TX_MSG_CMD, CEC_TX_ABORT);
+ 		tx_status = stat == CEC_TX_BUSY ? CEC_TX_STATUS_ARB_LOST :
+ 						   CEC_TX_STATUS_LOW_DRIVE;
+-		break;
+ 	}
+ 
+ 	meson_txc_cec_write(priv, CEC_TX_MSG_CMD, CEC_TX_NO_OP);

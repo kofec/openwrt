@@ -1,0 +1,148 @@
+From: kofec
+Subject: [PATCH] drm/meson: transwitch-hdmi: Meson6 CEC, acknowledge every counted frame
+
+Patch 149 (second version) drained the receive buffer only while the
+status was DONE and stopped on any other status without acknowledging.
+On 2026-11-20 (kernel 151b) the receiver stopped again: CEC_RX_NUM_MSG
+was 0x0f with CEC_RX_MSG_STATUS 0 (IDLE), read through the regmap
+debugfs, so the buffer was full and no frame and no interrupt came any
+more, while every frame libcec sent was acknowledged by the TV (status
+0x01) and its answers (Report Power Status) were never seen.
+
+Loop until NUM_MSG is 0 or a frame is on the bus (BUSY): read and
+acknowledge a DONE frame, and acknowledge (drop) a counted frame in any
+other state, as the vendor cec_ll_rx() does whenever the status is not
+DONE or NUM_MSG is not 1. The one-second safety net now looks at
+NUM_MSG as well, so a full buffer clears itself.
+
+After review by Gemini: wait 50 us after acknowledging a frame so the
+next frame's status settles before it is read, and drop the current
+frame when the receiver reports BUSY with frames counted over three
+one-second checks (a frame lasts at most ~0.45 s). CEC_RX_CLEAR_BUF is
+left alone: toggling it raised an interrupt storm before (patch 142).
+
+--- a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c	2026-11-20 14:18:59.803285700 +0100
++++ b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c	2026-11-20 14:23:44.312861700 +0100
+@@ -67,6 +67,7 @@
+ 	struct delayed_work		cec_rx_poll;
+ 	struct mutex			cec_rx_lock;
+ 	bool				cec_rx_stale;
++	unsigned int			cec_rx_busy_polls;
+ 	/* adapter enabled; the works check it instead of being cancelled sync */
+ 	bool				cec_on;
+ 	bool				cec_tx_pending;
+@@ -922,6 +923,7 @@
+ 	cancel_delayed_work(&priv->cec_tx_work);
+ 	priv->cec_tx_pending = false;
+ 	priv->cec_rx_stale = false;
++	priv->cec_rx_busy_polls = 0;
+ 
+ 	if (!enable) {
+ 		regmap_write(priv->regmap, HDMI_OTHER_CTRL0,
+@@ -1059,7 +1061,16 @@
+ {
+ 	unsigned int loop;
+ 
+-	for (loop = 0; loop < 8; loop++) {
++	/*
++	 * Until the buffer is empty (CEC_RX_NUM_MSG 0) or a frame is still on
++	 * the bus (BUSY). A frame counted in NUM_MSG while the status is not
++	 * DONE must be acknowledged as well: version 2 of this loop left those
++	 * alone and on 20.11 the box ended with NUM_MSG = 15, status IDLE, the
++	 * buffer full, nothing received and no interrupt any more, while the
++	 * TV acknowledged every frame Kodi sent. The vendor cec_ll_rx() drops
++	 * such frames the same way (ACK_CURRENT, NO_OP).
++	 */
++	for (loop = 0; loop < 16; loop++) {
+ 		struct cec_msg msg = {};
+ 		unsigned int stat, num, i;
+ 
+@@ -1068,17 +1079,19 @@
+ 		stat = meson_txc_cec_read(priv, CEC_RX_MSG_STATUS);
+ 		num = meson_txc_cec_read(priv, CEC_RX_NUM_MSG);
+ 
+-		if (stat == CEC_RX_ERROR) {
+-			/* drop the broken frame, look at the next one */
+-			meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_ACK_CURRENT);
+-			meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
++		if (!num || stat == CEC_RX_BUSY) {
+ 			mutex_unlock(&priv->cec_rx_lock);
+-			continue;
++			break;
+ 		}
+ 
+-		if (stat != CEC_RX_DONE || !num) {
++		if (stat != CEC_RX_DONE) {
++			/* IDLE or ERROR with a frame counted: drop it */
++			meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_ACK_CURRENT);
++			meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
++			/* let the next frame's status settle before reading it */
++			udelay(50);
+ 			mutex_unlock(&priv->cec_rx_lock);
+-			break;
++			continue;
+ 		}
+ 
+ 		msg.len = meson_txc_cec_read(priv, CEC_RX_MSG_LENGTH) + 1;
+@@ -1090,6 +1103,7 @@
+ 			msg.msg[i] = meson_txc_cec_read(priv,
+ 							CEC_RX_MSG_0_HEADER + i);
+ 		meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
++		udelay(50);
+ 		mutex_unlock(&priv->cec_rx_lock);
+ 
+ 		/* takes adap->lock: outside cec_rx_lock */
+@@ -1098,24 +1112,47 @@
+ }
+ 
+ /*
+- * Safety net for a lost edge: a frame (DONE) or an error still pending at
+- * two checks a second apart with no interrupt in between is handled here.
++ * Safety net for a lost edge: frames still counted in CEC_RX_NUM_MSG (and
++ * not on the bus) at two checks a second apart with no interrupt in
++ * between are handled here.
+  */
+ static void meson_txc_cec_rx_poll(struct work_struct *work)
+ {
+ 	struct meson_txc_hdmi *priv =
+ 		container_of(to_delayed_work(work), struct meson_txc_hdmi,
+ 			     cec_rx_poll);
+-	unsigned int stat;
++	unsigned int stat, num;
+ 
+ 	if (!READ_ONCE(priv->cec_on))
+ 		return;
+ 
+ 	stat = meson_txc_cec_read(priv, CEC_RX_MSG_STATUS);
+-	if (stat == CEC_RX_DONE || stat == CEC_RX_ERROR) {
++	num = meson_txc_cec_read(priv, CEC_RX_NUM_MSG);
++
++	/*
++	 * BUSY is a frame on the bus, at most ~0.45 s. BUSY with frames
++	 * counted over three checks (> 2 s) is a stuck receiver: drop the
++	 * current frame (CEC_RX_CLEAR_BUF here raised an interrupt storm in
++	 * an earlier version of this driver).
++	 */
++	if (num && stat == CEC_RX_BUSY) {
++		if (++priv->cec_rx_busy_polls >= 3) {
++			pr_info_ratelimited("meson6-hdmi-cec: RX busy for %u s with %u frames, dropping one\n",
++					    priv->cec_rx_busy_polls, num);
++			mutex_lock(&priv->cec_rx_lock);
++			meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_ACK_CURRENT);
++			meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
++			mutex_unlock(&priv->cec_rx_lock);
++			priv->cec_rx_busy_polls = 0;
++		}
++	} else {
++		priv->cec_rx_busy_polls = 0;
++	}
++
++	if (num && stat != CEC_RX_BUSY) {
+ 		if (priv->cec_rx_stale) {
+-			pr_info_ratelimited("meson6-hdmi-cec: RX status %u without interrupt, recovering\n",
+-					    stat);
++			pr_info_ratelimited("meson6-hdmi-cec: RX status %u, %u frames without interrupt, recovering\n",
++					    stat, num);
+ 			meson_txc_cec_rx(priv);
+ 		} else {
+ 			priv->cec_rx_stale = true;

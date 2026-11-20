@@ -1,0 +1,238 @@
+From: kofec
+Subject: [PATCH] drm/meson: transwitch-hdmi: Meson6 CEC, drain the receive buffer, no sync cancel under adap->lock
+
+After a boot (2026-11-20, kernel 148b) the CEC receiver stopped for good:
+the logical address was right (LA 1), but for minutes there was no CEC
+interrupt at all, not even when the TV switched inputs, and the TV remote
+did nothing in Kodi; resetting the adapter (Kodi restart) brought both
+directions back at once.
+
+The receive buffer holds more than one frame (CEC_RX_NUM_MSG). As the
+vendor cec_ll_rx(), the interrupt thread acknowledged the current frame
+unread whenever the count was not 1, and the interrupt is edge-triggered:
+a frame left behind keeps the line up without a new edge. Drain the
+buffer in a loop instead (DONE: read and acknowledge, ERROR: acknowledge,
+IDLE/BUSY: stop, BUSY being a frame still on the bus), call
+cec_received_msg() outside the driver's RX mutex, and keep a check of
+CEC_RX_MSG_STATUS once a second as a safety net for a lost edge (log
+"RX status ... without interrupt, recovering").
+
+adap_enable() runs with adap->lock held, and both works end in the CEC
+core, which takes adap->lock (cec_transmit_attempt_done(),
+cec_received_msg()), so cancel_delayed_work_sync() there could deadlock.
+Stop the works through a cec_on flag and a plain cancel_delayed_work();
+the sync cancel stays in .remove() after cec_unregister_adapter().
+Review by Gemini found the deadlock and the multi-frame case.
+
+--- a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c	2026-11-20 08:46:19.225769900 +0100
++++ b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c	2026-11-20 09:00:40.734458000 +0100
+@@ -64,6 +64,11 @@
+ 	unsigned long			cec_tx_min;
+ 	unsigned long			cec_irq_window;
+ 	unsigned int			cec_irq_count;
++	struct delayed_work		cec_rx_poll;
++	struct mutex			cec_rx_lock;
++	bool				cec_rx_stale;
++	/* adapter enabled; the works check it instead of being cancelled sync */
++	bool				cec_on;
+ 	bool				cec_tx_pending;
+ 	bool				cec_tx_seen_busy;
+ 
+@@ -852,7 +857,13 @@
+ #define CEC_RX_ACK_CURRENT		1
+ #define CEC_RX_DISABLE			2
+ 
++#define CEC_RX_IDLE			0
++#define CEC_RX_BUSY			1
+ #define CEC_RX_DONE			2
++#define CEC_RX_ERROR			3
++
++/* RX stall check, see meson_txc_cec_rx_poll() */
++#define CEC_RX_POLL_MS			1000
+ 
+ #define CEC_LOGICAL_ADDR_VALID		BIT(4)
+ 
+@@ -898,8 +909,19 @@
+ {
+ 	struct meson_txc_hdmi *priv = cec_get_drvdata(adap);
+ 
+-	cancel_delayed_work_sync(&priv->cec_tx_work);
++	/*
++	 * Called with adap->lock held: cancel_delayed_work_sync() here
++	 * deadlocks with a work that is waiting for adap->lock in
++	 * cec_transmit_attempt_done() or cec_received_msg(). Stop the works
++	 * through cec_on instead; one that already passed the check only ends
++	 * up in the CEC core after this returns, where a stale result is
++	 * ignored.
++	 */
++	WRITE_ONCE(priv->cec_on, false);
++	cancel_delayed_work(&priv->cec_rx_poll);
++	cancel_delayed_work(&priv->cec_tx_work);
+ 	priv->cec_tx_pending = false;
++	priv->cec_rx_stale = false;
+ 
+ 	if (!enable) {
+ 		regmap_write(priv->regmap, HDMI_OTHER_CTRL0,
+@@ -926,6 +948,10 @@
+ 
+ 	meson_txc_cec_clear(priv);
+ 
++	WRITE_ONCE(priv->cec_on, true);
++	schedule_delayed_work(&priv->cec_rx_poll,
++			      msecs_to_jiffies(CEC_RX_POLL_MS));
++
+ 	return 0;
+ }
+ 
+@@ -984,7 +1010,7 @@
+ 	unsigned int stat;
+ 	u8 tx_status;
+ 
+-	if (!priv->cec_tx_pending)
++	if (!READ_ONCE(priv->cec_on) || !priv->cec_tx_pending)
+ 		return;
+ 
+ 	/*
+@@ -1020,11 +1046,91 @@
+ 	cec_transmit_attempt_done(priv->cec_adap, tx_status);
+ }
+ 
++/*
++ * Drain the receive buffer. It holds more than one frame (CEC_RX_NUM_MSG):
++ * the vendor cec_ll_rx() threw the current frame away unread whenever two
++ * were waiting, and the interrupt is edge-triggered, so a frame left behind
++ * kept the line up without a new edge and reception stopped until the
++ * adapter was reset (20.11: no CEC interrupt for minutes after boot, LA
++ * right, TV input switches and remote ignored, Kodi restart fixed it).
++ * IDLE/BUSY are not acknowledged: BUSY is a frame still on the bus.
++ */
++static void meson_txc_cec_rx(struct meson_txc_hdmi *priv)
++{
++	unsigned int loop;
++
++	for (loop = 0; loop < 8; loop++) {
++		struct cec_msg msg = {};
++		unsigned int stat, num, i;
++
++		mutex_lock(&priv->cec_rx_lock);
++		priv->cec_rx_stale = false;
++		stat = meson_txc_cec_read(priv, CEC_RX_MSG_STATUS);
++		num = meson_txc_cec_read(priv, CEC_RX_NUM_MSG);
++
++		if (stat == CEC_RX_ERROR) {
++			/* drop the broken frame, look at the next one */
++			meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_ACK_CURRENT);
++			meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
++			mutex_unlock(&priv->cec_rx_lock);
++			continue;
++		}
++
++		if (stat != CEC_RX_DONE || !num) {
++			mutex_unlock(&priv->cec_rx_lock);
++			break;
++		}
++
++		msg.len = meson_txc_cec_read(priv, CEC_RX_MSG_LENGTH) + 1;
++		if (msg.len > CEC_MAX_MSG_SIZE)
++			msg.len = CEC_MAX_MSG_SIZE;
++
++		meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_ACK_CURRENT);
++		for (i = 0; i < msg.len; i++)
++			msg.msg[i] = meson_txc_cec_read(priv,
++							CEC_RX_MSG_0_HEADER + i);
++		meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
++		mutex_unlock(&priv->cec_rx_lock);
++
++		/* takes adap->lock: outside cec_rx_lock */
++		cec_received_msg(priv->cec_adap, &msg);
++	}
++}
++
++/*
++ * Safety net for a lost edge: a frame (DONE) or an error still pending at
++ * two checks a second apart with no interrupt in between is handled here.
++ */
++static void meson_txc_cec_rx_poll(struct work_struct *work)
++{
++	struct meson_txc_hdmi *priv =
++		container_of(to_delayed_work(work), struct meson_txc_hdmi,
++			     cec_rx_poll);
++	unsigned int stat;
++
++	if (!READ_ONCE(priv->cec_on))
++		return;
++
++	stat = meson_txc_cec_read(priv, CEC_RX_MSG_STATUS);
++	if (stat == CEC_RX_DONE || stat == CEC_RX_ERROR) {
++		if (priv->cec_rx_stale) {
++			pr_info_ratelimited("meson6-hdmi-cec: RX status %u without interrupt, recovering\n",
++					    stat);
++			meson_txc_cec_rx(priv);
++		} else {
++			priv->cec_rx_stale = true;
++		}
++	} else {
++		priv->cec_rx_stale = false;
++	}
++
++	schedule_delayed_work(&priv->cec_rx_poll,
++			      msecs_to_jiffies(CEC_RX_POLL_MS));
++}
++
+ static irqreturn_t meson_txc_cec_irq_thread(int irq, void *data)
+ {
+ 	struct meson_txc_hdmi *priv = data;
+-	struct cec_msg msg = {};
+-	unsigned int i;
+ 
+ 	/*
+ 	 * Safety net: an interrupt storm (seen at ~72000/s) must not keep a
+@@ -1045,28 +1151,8 @@
+ 	if (priv->cec_tx_pending)
+ 		mod_delayed_work(system_wq, &priv->cec_tx_work, 0);
+ 
+-	/*
+-	 * As the vendor cec_ll_rx(): acknowledge only. Toggling
+-	 * CEC_RX_CLEAR_BUF here raised the next interrupt, the thread kept
+-	 * re-triggering itself.
+-	 */
+-	if (meson_txc_cec_read(priv, CEC_RX_MSG_STATUS) != CEC_RX_DONE ||
+-	    meson_txc_cec_read(priv, CEC_RX_NUM_MSG) != 1) {
+-		meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_ACK_CURRENT);
+-		meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
+-		return IRQ_HANDLED;
+-	}
+-
+-	msg.len = meson_txc_cec_read(priv, CEC_RX_MSG_LENGTH) + 1;
+-	if (msg.len > CEC_MAX_MSG_SIZE)
+-		msg.len = CEC_MAX_MSG_SIZE;
+-
+-	meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_ACK_CURRENT);
+-	for (i = 0; i < msg.len; i++)
+-		msg.msg[i] = meson_txc_cec_read(priv, CEC_RX_MSG_0_HEADER + i);
+-	meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
+-
+-	cec_received_msg(priv->cec_adap, &msg);
++	if (READ_ONCE(priv->cec_on))
++		meson_txc_cec_rx(priv);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -1086,6 +1172,8 @@
+ 		return 0;
+ 
+ 	INIT_DELAYED_WORK(&priv->cec_tx_work, meson_txc_cec_tx_work);
++	INIT_DELAYED_WORK(&priv->cec_rx_poll, meson_txc_cec_rx_poll);
++	mutex_init(&priv->cec_rx_lock);
+ 
+ 	priv->cec_adap = cec_allocate_adapter(&meson_txc_cec_ops, priv,
+ 					      "meson6-hdmi-cec",
+@@ -1839,6 +1927,8 @@
+ 
+ 	if (priv->cec_adap) {
+ 		cec_unregister_adapter(priv->cec_adap);
++		/* adap->lock is not held here */
++		cancel_delayed_work_sync(&priv->cec_rx_poll);
+ 		cancel_delayed_work_sync(&priv->cec_tx_work);
+ 	}
+ 
