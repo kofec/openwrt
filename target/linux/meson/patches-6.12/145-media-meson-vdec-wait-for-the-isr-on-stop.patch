@@ -1,0 +1,119 @@
+From: kofec
+Subject: [PATCH] media: meson: vdec: keep the ISR thread off the buffers on stop, OUTPUT size floor
+
+vdec_stop_streaming() did not synchronise with the threaded ISR. On
+Meson6 the thread copies every picture out of the decoder-private planes
+with a byte swap, 9 ms for 576p and up to ~50 ms for 1080p, so a
+STREAMOFF during that copy cancelled the capture buffer it held
+(WARN in __vb2_queue_cancel) and vdec_free_canvas() freed the private
+planes it was reading: "Unable to handle kernel paging request" in
+dst_buf_done from codec_h264_threaded_isr, panic in interrupt context.
+
+Set a per-session flag that makes the threaded ISR return without
+touching anything and wait for a running one with synchronize_irq()
+before stopping. disable_irq()/enable_irq() does not work here: the
+mailbox interrupt stayed pending and fired on enable_irq() after the
+session was gone, NULL dereference in vdec_isr. Both handlers now also
+ignore an interrupt without a current session.
+
+FFmpeg also opens the decoder once while probing the stream, with a
+256x144 context and a 128-byte OUTPUT sizeimage. Every packet then failed
+in esparser_pad_start_code() and each one waited for the parser timeout.
+Give OUTPUT buffers at least 512 KiB.
+
+--- a/drivers/staging/media/meson/vdec/vdec.c	2026-11-19 18:03:57.551473200 +0100
++++ b/drivers/staging/media/meson/vdec/vdec.c	2026-11-19 19:03:19.969348700 +0100
+@@ -507,6 +507,19 @@
+ 	struct amvdec_core *core = sess->core;
+ 	struct vb2_v4l2_buffer *buf;
+ 
++	/*
++	 * Keep the threaded ISR away from the buffers and wait for a running
++	 * one. It takes capture buffers off the m2m queue and, on Meson6,
++	 * copies the picture out of the private planes (up to ~50 ms for
++	 * 1080p): cancelling the queue or vdec_free_canvas() under it freed
++	 * memory it was still reading (kernel paging request in dst_buf_done,
++	 * WARN in __vb2_queue_cancel). disable_irq() is no option: the
++	 * mailbox interrupt stays pending and fires on enable_irq() after
++	 * the session is gone.
++	 */
++	WRITE_ONCE(sess->isr_stop, true);
++	synchronize_irq(core->irq);
++
+ 	cancel_delayed_work_sync(&sess->drain_work);
+ 	vdec_reset_drain(sess);
+ 
+@@ -544,6 +557,8 @@
+ 
+ 		sess->streamon_cap = 0;
+ 	}
++
++	WRITE_ONCE(sess->isr_stop, false);
+ }
+ 
+ static int vdec_vb2_buf_prepare(struct vb2_buffer *vb)
+@@ -634,6 +649,13 @@
+ 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+ 		if (!pfmt[0].sizeimage)
+ 			pfmt[0].sizeimage = sess->src_buffer_size;
++		/*
++		 * Room for a whole compressed picture plus the esparser padding
++		 * (4 KiB minimum packet + search pattern): FFmpeg probes the
++		 * stream with a 256x144 context and asks for 128 bytes, every
++		 * packet then failed to pad and timed out in the parser.
++		 */
++		pfmt[0].sizeimage = max_t(u32, pfmt[0].sizeimage, SZ_512K);
+ 		pfmt[0].bytesperline = 0;
+ 		pixmp->num_planes = 1;
+ 	} else if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+@@ -1082,7 +1104,10 @@
+ static irqreturn_t vdec_isr(int irq, void *data)
+ {
+ 	struct amvdec_core *core = data;
+-	struct amvdec_session *sess = core->cur_sess;
++	struct amvdec_session *sess = READ_ONCE(core->cur_sess);
++
++	if (!sess)
++		return IRQ_HANDLED;
+ 
+ 	sess->last_irq_jiffies = get_jiffies_64();
+ 
+@@ -1092,7 +1117,10 @@
+ static irqreturn_t vdec_threaded_isr(int irq, void *data)
+ {
+ 	struct amvdec_core *core = data;
+-	struct amvdec_session *sess = core->cur_sess;
++	struct amvdec_session *sess = READ_ONCE(core->cur_sess);
++
++	if (!sess || READ_ONCE(sess->isr_stop))
++		return IRQ_HANDLED;
+ 
+ 	return sess->fmt_out->codec_ops->threaded_isr(sess);
+ }
+@@ -1188,6 +1216,7 @@
+ 	if (irq < 0)
+ 		return irq;
+ 
++	core->irq = irq;
+ 	ret = devm_request_threaded_irq(core->dev, irq, vdec_isr,
+ 					vdec_threaded_isr, IRQF_ONESHOT,
+ 					"vdec", core);
+--- a/drivers/staging/media/meson/vdec/vdec.h	2026-11-19 18:03:57.698477500 +0100
++++ b/drivers/staging/media/meson/vdec/vdec.h	2026-11-19 19:03:19.967348100 +0100
+@@ -91,6 +91,7 @@
+ 
+ 	struct amvdec_session *cur_sess;
+ 	struct mutex lock;
++	int irq;
+ };
+ 
+ /**
+@@ -294,6 +295,8 @@
+ 	spinlock_t ts_spinlock; /* timestamp list lock */
+ 
+ 	u64 last_irq_jiffies;
++	/* set by stop_streaming: the threaded ISR must leave the buffers */
++	bool isr_stop;
+ 	u32 last_offset;
+ 	u32 wrap_count;
+ 	u32 fw_idx_to_vb2_idx[32];

@@ -1,0 +1,230 @@
+From: kofec
+Subject: [PATCH] media: meson: vdec: Meson6 swapped copy off the RT interrupt thread, cached planes
+
+On Meson6 the decoder writes into private planes and dst_buf_done()
+copied every picture byte swapped into the vb2 buffer, from the
+decoder's threaded interrupt handler, a SCHED_FIFO thread. With H.264
+1080i live TV in Kodi (2026-11-20) a copy took 50-80 ms per picture from
+the uncached coherent planes, the thread took most of a CPU ("sched: RT
+throttling activated"), and Kodi, sshd and Domoticz on the box starved
+until the box had to be power cycled.
+
+Queue the picture instead and copy and complete it from a work item on
+system_unbound_wq, at normal priority and in order (a work item never
+runs concurrently with itself). stop_streaming() flushes the work after
+synchronize_irq(), and the drain watchdog flushes it before returning an
+empty LAST buffer, so LAST does not overtake pending pictures.
+
+Allocate the private planes with dma_alloc_noncoherent() and sync them
+for the CPU before the copy and back for the device after it: reading a
+cached source is much faster (measured on 14.11 with a 1080p picture:
+~40 % less than from write-combined memory).
+
+--- a/drivers/staging/media/meson/vdec/vdec.c	2026-11-19 23:44:06.000000000 +0100
++++ b/drivers/staging/media/meson/vdec/vdec.c	2026-11-20 12:52:14.979542000 +0100
+@@ -206,6 +206,8 @@
+ 	}
+ 	sess->last_sent = 1;
+ 	v4l2_event_queue_fh(&sess->fh, &ev);
++	/* the empty LAST must not overtake pictures still being copied */
++	flush_work(&sess->m6_copy_work);
+ 	v4l2_m2m_last_buffer_done(sess->m2m_ctx, vbuf);
+ 	return;
+ 
+@@ -535,6 +537,8 @@
+ 	 */
+ 	WRITE_ONCE(sess->isr_stop, true);
+ 	synchronize_irq(core->irq);
++	/* Meson6: pictures still being copied hold buffers and planes */
++	flush_work(&sess->m6_copy_work);
+ 
+ 	cancel_delayed_work_sync(&sess->drain_work);
+ 	vdec_reset_drain(sess);
+@@ -1069,6 +1073,9 @@
+ 	INIT_LIST_HEAD(&sess->bufs_recycle);
+ 	INIT_WORK(&sess->esparser_queue_work, esparser_queue_all_src);
+ 	INIT_DELAYED_WORK(&sess->drain_work, vdec_drain_work);
++	INIT_LIST_HEAD(&sess->m6_copy_list);
++	spin_lock_init(&sess->m6_copy_lock);
++	INIT_WORK(&sess->m6_copy_work, amvdec_m6_copy_work);
+ 	mutex_init(&sess->lock);
+ 	mutex_init(&sess->bufs_recycle_lock);
+ 	spin_lock_init(&sess->ts_spinlock);
+--- a/drivers/staging/media/meson/vdec/vdec.h	2026-11-19 23:44:15.000000000 +0100
++++ b/drivers/staging/media/meson/vdec/vdec.h	2026-11-20 12:52:14.937903300 +0100
+@@ -315,6 +315,13 @@
+ 	void *m6_vaddr[VB2_MAX_FRAME][3];
+ 	dma_addr_t m6_paddr[VB2_MAX_FRAME][3];
+ 	size_t m6_size[VB2_MAX_FRAME][3];
++	/*
++	 * Meson6: pictures waiting for the swapped copy, done in order by
++	 * m6_copy_work at normal priority instead of the RT interrupt thread
++	 */
++	struct list_head m6_copy_list;
++	spinlock_t m6_copy_lock;
++	struct work_struct m6_copy_work;
+ 
+ 	enum amvdec_status status;
+ 	void *priv;
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c	2026-11-19 16:55:04.000000000 +0100
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c	2026-11-20 12:53:11.315875900 +0100
+@@ -7,6 +7,8 @@
+ #include <linux/gcd.h>
+ #include <linux/ktime.h>
+ #include <linux/swab.h>
++#include <linux/slab.h>
++#include <linux/workqueue.h>
+ #ifdef CONFIG_KERNEL_MODE_NEON
+ #include <asm/neon.h>
+ #include <asm/simd.h>
+@@ -296,20 +298,29 @@
+ 		return vb2_dma_contig_plane_dma_addr(vb, plane);
+ 
+ 	if (sess->m6_vaddr[idx][plane] && sess->m6_size[idx][plane] != size) {
+-		dma_free_coherent(dev, sess->m6_size[idx][plane],
+-				  sess->m6_vaddr[idx][plane],
+-				  sess->m6_paddr[idx][plane]);
++		dma_free_noncoherent(dev, sess->m6_size[idx][plane],
++				     sess->m6_vaddr[idx][plane],
++				     sess->m6_paddr[idx][plane],
++				     DMA_FROM_DEVICE);
+ 		sess->m6_vaddr[idx][plane] = NULL;
+ 	}
+ 
++	/*
++	 * Cached (non-coherent) planes: the CPU reads each picture once for
++	 * the swapped copy, which is much faster from cached memory than from
++	 * an uncached coherent mapping (1080p: ~50 ms, measured 14.11 with a
++	 * cached source ~40 % less). Synced around every copy.
++	 */
+ 	if (!sess->m6_vaddr[idx][plane]) {
+ 		sess->m6_vaddr[idx][plane] =
+-			dma_alloc_coherent(dev, size,
+-					   &sess->m6_paddr[idx][plane],
+-					   GFP_KERNEL);
++			dma_alloc_noncoherent(dev, size,
++					      &sess->m6_paddr[idx][plane],
++					      DMA_FROM_DEVICE, GFP_KERNEL);
+ 		if (!sess->m6_vaddr[idx][plane])
+ 			return 0;
+ 		sess->m6_size[idx][plane] = size;
++		dma_sync_single_for_device(dev, sess->m6_paddr[idx][plane],
++					   size, DMA_FROM_DEVICE);
+ 	}
+ 
+ 	return sess->m6_paddr[idx][plane];
+@@ -323,9 +334,11 @@
+ 		for (p = 0; p < 3; p++) {
+ 			if (!sess->m6_vaddr[i][p])
+ 				continue;
+-			dma_free_coherent(sess->core->dev, sess->m6_size[i][p],
+-					  sess->m6_vaddr[i][p],
+-					  sess->m6_paddr[i][p]);
++			dma_free_noncoherent(sess->core->dev,
++					     sess->m6_size[i][p],
++					     sess->m6_vaddr[i][p],
++					     sess->m6_paddr[i][p],
++					     DMA_FROM_DEVICE);
+ 			sess->m6_vaddr[i][p] = NULL;
+ 		}
+ }
+@@ -376,10 +389,16 @@
+ 	for (i = 0; i < vb->num_planes && i < 3; i++) {
+ 		void *dst = vb2_plane_vaddr(vb, i);
+ 		void *src = sess->m6_vaddr[vb->index][i];
++		dma_addr_t paddr = sess->m6_paddr[vb->index][i];
++		size_t len = vb2_get_plane_payload(vb, i);
+ 
+-		if (dst && src)
+-			meson6_copy_swap64(dst, src,
+-					   vb2_get_plane_payload(vb, i));
++		if (!dst || !src)
++			continue;
++		dma_sync_single_for_cpu(sess->core->dev, paddr, len,
++					DMA_FROM_DEVICE);
++		meson6_copy_swap64(dst, src, len);
++		dma_sync_single_for_device(sess->core->dev, paddr, len,
++					   DMA_FROM_DEVICE);
+ 	}
+ 
+ 	if (vbuf->sequence == 0)
+@@ -388,6 +407,44 @@
+ 			 ktime_us_delta(ktime_get(), t0));
+ }
+ 
++struct amvdec_m6_copy {
++	struct list_head list;
++	struct vb2_v4l2_buffer *vbuf;
++};
++
++/*
++ * Meson6: the swapped copy (up to ~80 ms for a 1080p picture) ran in the
++ * decoder's threaded interrupt handler, a SCHED_FIFO thread: with H.264
++ * 1080i live TV it took most of a CPU, "sched: RT throttling activated",
++ * and Kodi, sshd and the rest of the box starved. Copy and complete the
++ * pictures here instead, in order (a work item never runs concurrently
++ * with itself), at normal priority.
++ */
++void amvdec_m6_copy_work(struct work_struct *work)
++{
++	struct amvdec_session *sess =
++		container_of(work, struct amvdec_session, m6_copy_work);
++	struct amvdec_m6_copy *item;
++	unsigned long flags;
++
++	for (;;) {
++		spin_lock_irqsave(&sess->m6_copy_lock, flags);
++		item = list_first_entry_or_null(&sess->m6_copy_list,
++						struct amvdec_m6_copy, list);
++		if (item)
++			list_del(&item->list);
++		spin_unlock_irqrestore(&sess->m6_copy_lock, flags);
++		if (!item)
++			break;
++
++		meson6_copy_planes(sess, item->vbuf);
++		v4l2_m2m_buf_done(item->vbuf, VB2_BUF_STATE_DONE);
++		kfree(item);
++		cond_resched();
++	}
++}
++EXPORT_SYMBOL_GPL(amvdec_m6_copy_work);
++
+ static void dst_buf_done(struct amvdec_session *sess,
+ 			 struct vb2_v4l2_buffer *vbuf,
+ 			 u32 field, u64 timestamp,
+@@ -433,10 +490,22 @@
+ 	dev_dbg(dev, "Buffer %u done, ts = %llu, flags = %08X\n",
+ 		vbuf->vb2_buf.index, timestamp, flags);
+ 	vbuf->field = field;
+-	if (sess->core->platform->meson6)
++	if (sess->core->platform->meson6) {
++		struct amvdec_m6_copy *item = kmalloc(sizeof(*item), GFP_KERNEL);
++		unsigned long irqflags;
++
++		if (item) {
++			item->vbuf = vbuf;
++			spin_lock_irqsave(&sess->m6_copy_lock, irqflags);
++			list_add_tail(&item->list, &sess->m6_copy_list);
++			spin_unlock_irqrestore(&sess->m6_copy_lock, irqflags);
++			queue_work(system_unbound_wq, &sess->m6_copy_work);
++			goto out;
++		}
+ 		meson6_copy_planes(sess, vbuf);
++	}
+ 	v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_DONE);
+-
++out:
+ 	/* Buffer done probably means the vififo got freed */
+ 	schedule_work(&sess->esparser_queue_work);
+ }
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.h	2026-11-19 16:55:04.000000000 +0100
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.h	2026-11-20 12:52:14.939908200 +0100
+@@ -17,6 +17,7 @@
+  * @reg_num: number of contiguous registers after each reg_base (including it)
+  */
+ void amvdec_m6_free_pics(struct amvdec_session *sess);
++void amvdec_m6_copy_work(struct work_struct *work);
+ 
+ int amvdec_set_canvases(struct amvdec_session *sess,
+ 			u32 reg_base[], u32 reg_num[]);
