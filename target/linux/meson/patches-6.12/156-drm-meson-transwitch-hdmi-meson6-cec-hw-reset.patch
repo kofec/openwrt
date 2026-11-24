@@ -1,0 +1,145 @@
+From: kofec
+Subject: [PATCH] drm/meson: transwitch-hdmi: Meson6 CEC hardware reset on wedged RX
+
+When the Meson6 CEC receiver wedges with CEC_RX_MSG_STATUS == 0 (IDLE) and
+CEC_RX_NUM_MSG > 0, the hardware ignores CEC_RX_ACK_CURRENT and never clears
+the RX counter or raises further RX interrupts.
+
+Detect unchanged CEC_RX_NUM_MSG after acknowledging in cec_rx_poll, perform a
+full CEC controller hardware reset (meson_txc_cec_hw_reset()), and restore the
+saved CEC_LOGICAL_ADDR0 mask so TV remote input recovers automatically.
+
+--- a/drivers/gpu/drm/meson/meson_transwitch_hdmi.c
++++ b/drivers/gpu/drm/meson/meson_transwitch_hdmi.c
+@@ -72,6 +72,7 @@
+ 	bool				cec_on;
+ 	bool				cec_tx_pending;
+ 	bool				cec_tx_seen_busy;
++	u8				cec_log_addr;
+ 
+ 	struct drm_bridge		bridge;
+ 	struct drm_bridge		*next_bridge;
+@@ -906,6 +907,37 @@
+ 	meson_txc_cec_write(priv, CEC_TX_MSG_CMD, CEC_TX_NO_OP);
+ }
+ 
++static void meson_txc_cec_hw_reset(struct meson_txc_hdmi *priv)
++{
++	u8 la = READ_ONCE(priv->cec_log_addr);
++
++	/* vendor: cec_hw_reset() */
++	writel(readl(priv->base + HDMI_CTRL_PORT) | HDMI_CTRL_PORT_CEC_RESET,
++	       priv->base + HDMI_CTRL_PORT);
++	regmap_write(priv->regmap, HDMI_OTHER_CTRL0, HDMI_OTHER_CTRL0_CEC_RESET);
++	meson_txc_cec_write(priv, CEC_TX_CLEAR_BUF, 1);
++	meson_txc_cec_write(priv, CEC_RX_CLEAR_BUF, 1);
++	udelay(100);
++	meson_txc_cec_write(priv, CEC_TX_CLEAR_BUF, 0);
++	meson_txc_cec_write(priv, CEC_RX_CLEAR_BUF, 0);
++	regmap_write(priv->regmap, HDMI_OTHER_CTRL0, 0);
++	writel(readl(priv->base + HDMI_CTRL_PORT) & ~HDMI_CTRL_PORT_CEC_RESET,
++	       priv->base + HDMI_CTRL_PORT);
++
++	meson_txc_cec_write(priv, CEC_CLOCK_DIV_H, 0x00);
++	meson_txc_cec_write(priv, CEC_CLOCK_DIV_L, 0xf0);
++	meson_txc_cec_write(priv, CEC_LOGICAL_ADDR0, 0);
++
++	meson_txc_cec_clear(priv);
++
++	if (la != CEC_LOG_ADDR_INVALID) {
++		meson_txc_cec_write(priv, CEC_LOGICAL_ADDR0, la & 0xf);
++		udelay(100);
++		meson_txc_cec_write(priv, CEC_LOGICAL_ADDR0,
++				    (la & 0xf) | CEC_LOGICAL_ADDR_VALID);
++	}
++}
++
+ static int meson_txc_cec_adap_enable(struct cec_adapter *adap, bool enable)
+ {
+ 	struct meson_txc_hdmi *priv = cec_get_drvdata(adap);
+@@ -931,24 +963,8 @@
+ 		return 0;
+ 	}
+ 
+-	/* vendor: cec_hw_reset() */
+-	writel(readl(priv->base + HDMI_CTRL_PORT) | HDMI_CTRL_PORT_CEC_RESET,
+-	       priv->base + HDMI_CTRL_PORT);
+-	regmap_write(priv->regmap, HDMI_OTHER_CTRL0, HDMI_OTHER_CTRL0_CEC_RESET);
+-	meson_txc_cec_write(priv, CEC_TX_CLEAR_BUF, 1);
+-	meson_txc_cec_write(priv, CEC_RX_CLEAR_BUF, 1);
+-	udelay(100);
+-	meson_txc_cec_write(priv, CEC_TX_CLEAR_BUF, 0);
+-	meson_txc_cec_write(priv, CEC_RX_CLEAR_BUF, 0);
+-	regmap_write(priv->regmap, HDMI_OTHER_CTRL0, 0);
+-	writel(readl(priv->base + HDMI_CTRL_PORT) & ~HDMI_CTRL_PORT_CEC_RESET,
+-	       priv->base + HDMI_CTRL_PORT);
+-
+-	meson_txc_cec_write(priv, CEC_CLOCK_DIV_H, 0x00);
+-	meson_txc_cec_write(priv, CEC_CLOCK_DIV_L, 0xf0);
+-	meson_txc_cec_write(priv, CEC_LOGICAL_ADDR0, 0);
+-
+-	meson_txc_cec_clear(priv);
++	WRITE_ONCE(priv->cec_log_addr, CEC_LOG_ADDR_INVALID);
++	meson_txc_cec_hw_reset(priv);
+ 
+ 	WRITE_ONCE(priv->cec_on, true);
+ 	schedule_delayed_work(&priv->cec_rx_poll,
+@@ -961,6 +977,7 @@
+ {
+ 	struct meson_txc_hdmi *priv = cec_get_drvdata(adap);
+ 
++	WRITE_ONCE(priv->cec_log_addr, logical_addr);
+ 	meson_txc_cec_write(priv, CEC_LOGICAL_ADDR0, 0);
+ 	meson_txc_cec_clear(priv);
+ 
+@@ -1085,11 +1102,20 @@
+ 		}
+ 
+ 		if (stat != CEC_RX_DONE) {
+-			/* IDLE or ERROR with a frame counted: drop it */
++			/* IDLE or ERROR with a frame counted: try dropping it */
+ 			meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_ACK_CURRENT);
+ 			meson_txc_cec_write(priv, CEC_RX_MSG_CMD, CEC_RX_NO_OP);
+ 			/* let the next frame's status settle before reading it */
+ 			udelay(50);
++			if (meson_txc_cec_read(priv, CEC_RX_NUM_MSG) >= num) {
++				/*
++				 * Hardware ignores ACK_CURRENT when wedged in
++				 * IDLE with NUM_MSG > 0; stop spinning and let
++				 * cec_rx_poll do a full CEC controller reset.
++				 */
++				mutex_unlock(&priv->cec_rx_lock);
++				break;
++			}
+ 			mutex_unlock(&priv->cec_rx_lock);
+ 			continue;
+ 		}
+@@ -1154,6 +1180,28 @@
+ 			pr_info_ratelimited("meson6-hdmi-cec: RX status %u, %u frames without interrupt, recovering\n",
+ 					    stat, num);
+ 			meson_txc_cec_rx(priv);
++
++			/*
++			 * If ACK_CURRENT did not clear NUM_MSG (observed:
++			 * status 0 / IDLE with 1..15 frames stuck forever),
++			 * reset the CEC controller and restore the logical
++			 * address without disrupting Kodi.
++			 */
++			stat = meson_txc_cec_read(priv, CEC_RX_MSG_STATUS);
++			num = meson_txc_cec_read(priv, CEC_RX_NUM_MSG);
++			if (num && stat != CEC_RX_BUSY &&
++			    !READ_ONCE(priv->cec_tx_pending)) {
++				mutex_lock(&priv->cec_rx_lock);
++				if (READ_ONCE(priv->cec_on) &&
++				    !READ_ONCE(priv->cec_tx_pending)) {
++					pr_info_ratelimited("meson6-hdmi-cec: RX wedged (status %u, %u frames), resetting CEC controller\n",
++							    stat, num);
++					meson_txc_cec_hw_reset(priv);
++					priv->cec_rx_stale = false;
++					priv->cec_rx_busy_polls = 0;
++				}
++				mutex_unlock(&priv->cec_rx_lock);
++			}
+ 		} else {
+ 			priv->cec_rx_stale = true;
+ 		}
