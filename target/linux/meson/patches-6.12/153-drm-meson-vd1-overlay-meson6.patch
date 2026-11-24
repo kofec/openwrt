@@ -1,0 +1,173 @@
+From: kofec
+Subject: [PATCH] drm/meson: enable VD1 overlay plane on Meson6/Meson8
+
+On Meson6/Meson8 (VPU_COMPATIBLE_M8):
+- meson-canvas rejects MESON_CANVAS_ENDIAN_SWAP64 with -EINVAL, so configure
+  VD1 canvases with endian=0 (native hardware byte order, matching the decoder);
+- match the vendor viu_set_dcu() VD1_IF0_GEN_REG settings (hold lines 17 and
+  VD_RESET_ON_GO_FIELD);
+- omit GXBB-only VPP_MISC bit 28 (VPP_COLOR_MNG_ENABLE), VIU_MISC_CTRL0, and
+  AFBC registers/formats on Meson6/8.
+
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -286,6 +286,14 @@
+ 
+ static void meson_crtc_enable_vd1(struct meson_drm *priv)
+ {
++	if (meson_vpu_is_meson8_family(priv)) {
++		/* No colour management bit and no AFBC mux before GXBB */
++		writel_bits_relaxed(VPP_VD1_PREBLEND | VPP_VD1_POSTBLEND,
++				    VPP_VD1_PREBLEND | VPP_VD1_POSTBLEND,
++				    priv->io_base + _REG(VPP_MISC));
++		return;
++	}
++
+ 	writel_bits_relaxed(VPP_VD1_PREBLEND | VPP_VD1_POSTBLEND |
+ 			    VPP_COLOR_MNG_ENABLE,
+ 			    VPP_VD1_PREBLEND | VPP_VD1_POSTBLEND |
+@@ -390,6 +398,8 @@
+ 
+ 	/* Update the VD1 registers */
+ 	if (priv->viu.vd1_enabled && priv->viu.vd1_commit) {
++		unsigned int vd1_endian = meson_vpu_is_meson8_family(priv) ?
++					  0 : MESON_CANVAS_ENDIAN_SWAP64;
+ 
+ 		if (priv->viu.vd1_afbc) {
+ 			writel_relaxed(priv->viu.vd1_afbc_head_addr,
+@@ -447,7 +457,7 @@
+ 						    priv->viu.vd1_height2,
+ 						    MESON_CANVAS_WRAP_NONE,
+ 						    MESON_CANVAS_BLKMODE_LINEAR,
+-						    MESON_CANVAS_ENDIAN_SWAP64);
++						    vd1_endian);
+ 				fallthrough;
+ 			case 2:
+ 				meson_canvas_config(priv->canvas,
+@@ -457,7 +467,7 @@
+ 						    priv->viu.vd1_height1,
+ 						    MESON_CANVAS_WRAP_NONE,
+ 						    MESON_CANVAS_BLKMODE_LINEAR,
+-						    MESON_CANVAS_ENDIAN_SWAP64);
++						    vd1_endian);
+ 				fallthrough;
+ 			case 1:
+ 				meson_canvas_config(priv->canvas,
+@@ -467,10 +477,12 @@
+ 						    priv->viu.vd1_height0,
+ 						    MESON_CANVAS_WRAP_NONE,
+ 						    MESON_CANVAS_BLKMODE_LINEAR,
+-						    MESON_CANVAS_ENDIAN_SWAP64);
++						    vd1_endian);
+ 			}
+ 
+-			writel_relaxed(0, priv->io_base + _REG(AFBC_ENABLE));
++			if (!meson_vpu_is_meson8_family(priv))
++				writel_relaxed(0, priv->io_base +
++					       _REG(AFBC_ENABLE));
+ 		}
+ 
+ 		writel_relaxed(priv->viu.vd1_if0_gen_reg,
+--- a/drivers/gpu/drm/meson/meson_drv.h
++++ b/drivers/gpu/drm/meson/meson_drv.h
+@@ -224,4 +224,16 @@
+ 	return priv->compat == family;
+ }
+ 
++/*
++ * Meson6 (matched as VPU_COMPATIBLE_M8) and Meson8/8b/8m2: the canvas has no
++ * endianness control (VD1 reads memory in the video decoder's byte order)
++ * and there is no AFBC decoder.
++ */
++static inline bool meson_vpu_is_meson8_family(struct meson_drm *priv)
++{
++	return meson_vpu_is_compatible(priv, VPU_COMPATIBLE_M8) ||
++	       meson_vpu_is_compatible(priv, VPU_COMPATIBLE_M8B) ||
++	       meson_vpu_is_compatible(priv, VPU_COMPATIBLE_M8M2);
++}
++
+ #endif /* __MESON_DRV_H */
+--- a/drivers/gpu/drm/meson/meson_overlay.c
++++ b/drivers/gpu/drm/meson/meson_overlay.c
+@@ -23,6 +23,7 @@
+ #include "meson_vpp.h"
+ 
+ /* VD1_IF0_GEN_REG */
++#define VD_RESET_ON_GO_FIELD		BIT(29)
+ #define VD_URGENT_CHROMA		BIT(28)
+ #define VD_URGENT_LUMA			BIT(27)
+ #define VD_HOLD_LINES(lines)		FIELD_PREP(GENMASK(24, 19), lines)
+@@ -544,6 +545,15 @@
+ 					    VD_HOLD_LINES(9) |
+ 					    VD_CHRO_RPT_LASTL_CTRL |
+ 					    VD_ENABLE;
++
++		/* Meson6 vendor video.c viu_set_dcu() values */
++		if (meson_vpu_is_meson8_family(priv))
++			priv->viu.vd1_if0_gen_reg = VD_RESET_ON_GO_FIELD |
++						    VD_URGENT_CHROMA |
++						    VD_URGENT_LUMA |
++						    VD_HOLD_LINES(17) |
++						    VD_CHRO_RPT_LASTL_CTRL |
++						    VD_ENABLE;
+ 	}
+ 
+ 	/* Setup scaler params */
+@@ -753,6 +763,11 @@
+ static bool meson_overlay_format_mod_supported(struct drm_plane *plane,
+ 					       u32 format, u64 modifier)
+ {
++	struct meson_overlay *meson_overlay = to_meson_overlay(plane);
++
++	if (meson_vpu_is_meson8_family(meson_overlay->priv))
++		return modifier == DRM_FORMAT_MOD_LINEAR;
++
+ 	if (modifier == DRM_FORMAT_MOD_LINEAR &&
+ 	    format != DRM_FORMAT_YUV420_8BIT &&
+ 	    format != DRM_FORMAT_YUV420_10BIT)
+@@ -831,8 +846,30 @@
+ 	DRM_FORMAT_MOD_INVALID,
+ };
+ 
++/*
++ * Meson6/8: no AFBC. The canvas cannot swap bytes, so VD1 reads memory in the
++ * order the video decoder writes it; a CPU-filled LINEAR buffer shows every
++ * 8 bytes reversed (and U/V swapped in the chroma plane).
++ */
++static const uint32_t supported_drm_formats_m8[] = {
++	DRM_FORMAT_YUYV,
++	DRM_FORMAT_NV12,
++	DRM_FORMAT_NV21,
++	DRM_FORMAT_YUV444,
++	DRM_FORMAT_YUV422,
++	DRM_FORMAT_YUV420,
++	DRM_FORMAT_YUV411,
++	DRM_FORMAT_YUV410,
++};
++
++static const uint64_t format_modifiers_m8[] = {
++	DRM_FORMAT_MOD_LINEAR,
++	DRM_FORMAT_MOD_INVALID,
++};
++
+ int meson_overlay_create(struct meson_drm *priv)
+ {
++	bool m8 = meson_vpu_is_meson8_family(priv);
+ 	struct meson_overlay *meson_overlay;
+ 	struct drm_plane *plane;
+ 
+@@ -848,9 +885,11 @@
+ 
+ 	drm_universal_plane_init(priv->drm, plane, 0xFF,
+ 				 &meson_overlay_funcs,
+-				 supported_drm_formats,
+-				 ARRAY_SIZE(supported_drm_formats),
+-				 format_modifiers,
++				 m8 ? supported_drm_formats_m8 :
++				      supported_drm_formats,
++				 m8 ? ARRAY_SIZE(supported_drm_formats_m8) :
++				      ARRAY_SIZE(supported_drm_formats),
++				 m8 ? format_modifiers_m8 : format_modifiers,
+ 				 DRM_PLANE_TYPE_OVERLAY, "meson_overlay_plane");
+ 
+ 	drm_plane_helper_add(plane, &meson_overlay_helper_funcs);

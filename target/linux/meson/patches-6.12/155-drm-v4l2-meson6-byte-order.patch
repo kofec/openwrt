@@ -1,0 +1,243 @@
+From: kofec
+Subject: [PATCH] drm/meson, media/meson-vdec: zero-copy Meson6 byte order modifier and fourcc
+
+Meson6 canvases do not support SWAP64 endianness conversion, so the hardware
+video decoder writes frames in its native 64-bit swapped byte order and VD1
+reads that same native layout directly.
+
+- DRM: add DRM_FORMAT_MOD_AMLOGIC_MESON6_SWAP64 (bit 16, outside AMLOGIC_FBC
+  bits 0..15), guard the AFBC path in meson_overlay_atomic_update() with
+  !meson_vpu_is_meson8_family(priv), and restrict Meson6/8 VD1 IN_FORMATS to
+  Meson6 modifiers so LINEAR CPU/GPU buffers are rejected at AddFB2.
+- V4L2 / meson-vdec: add V4L2_PIX_FMT_NV12M_AMLOGIC_M6 ('AM12') alongside the
+  default 'NM12' capture format on Meson6. Selecting 'AM12' points decoder
+  canvases directly at vb2 capture buffers and skips private planes and the
+  NEON byte-swap copy for full zero-copy EXPBUF -> DRM VD1 playback.
+
+--- a/include/uapi/drm/drm_fourcc.h
++++ b/include/uapi/drm/drm_fourcc.h
+@@ -1454,6 +1454,16 @@
+ #define AMLOGIC_FBC_OPTION_MEM_SAVING		(1ULL << 0)
+ 
+ /*
++ * Amlogic Meson6/Meson8 native canvas byte order (no 64-bit endian swap)
++ *
++ * On Meson6/Meson8 the canvas LUT has no endianness swap bits. Both the
++ * hardware video decoder (VDEC_1) and the video display unit (VD1) access
++ * YUV memory with each 64-bit word byte-reversed compared to CPU order.
++ * Bit 16 stays outside the AMLOGIC_FBC layout/options fields (bits 0..15).
++ */
++#define DRM_FORMAT_MOD_AMLOGIC_MESON6_SWAP64	fourcc_mod_code(AMLOGIC, (1ULL << 16))
++
++/*
+  * AMD modifiers
+  *
+  * Memory layout:
+--- a/drivers/gpu/drm/meson/meson_overlay.c
++++ b/drivers/gpu/drm/meson/meson_overlay.c
+@@ -487,7 +487,8 @@
+ 
+ 	spin_lock_irqsave(&priv->drm->event_lock, flags);
+ 
+-	if ((fb->modifier & DRM_FORMAT_MOD_AMLOGIC_FBC(0, 0)) ==
++	if (!meson_vpu_is_meson8_family(priv) &&
++	    (fb->modifier & DRM_FORMAT_MOD_AMLOGIC_FBC(0, 0)) ==
+ 			    DRM_FORMAT_MOD_AMLOGIC_FBC(0, 0)) {
+ 		priv->viu.vd1_afbc = true;
+ 
+@@ -766,7 +767,7 @@
+ 	struct meson_overlay *meson_overlay = to_meson_overlay(plane);
+ 
+ 	if (meson_vpu_is_meson8_family(meson_overlay->priv))
+-		return modifier == DRM_FORMAT_MOD_LINEAR;
++		return modifier == DRM_FORMAT_MOD_AMLOGIC_MESON6_SWAP64;
+ 
+ 	if (modifier == DRM_FORMAT_MOD_LINEAR &&
+ 	    format != DRM_FORMAT_YUV420_8BIT &&
+@@ -863,7 +864,7 @@
+ };
+ 
+ static const uint64_t format_modifiers_m8[] = {
+-	DRM_FORMAT_MOD_LINEAR,
++	DRM_FORMAT_MOD_AMLOGIC_MESON6_SWAP64,
+ 	DRM_FORMAT_MOD_INVALID,
+ };
+ 
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -687,6 +687,7 @@
+ #define V4L2_PIX_FMT_NV12MT_16X16 v4l2_fourcc('V', 'M', '1', '2') /* 12  Y/CbCr 4:2:0 16x16 tiles */
+ #define V4L2_PIX_FMT_NV12M_8L128      v4l2_fourcc('N', 'A', '1', '2') /* Y/CbCr 4:2:0 8x128 tiles */
+ #define V4L2_PIX_FMT_NV12M_10BE_8L128 v4l2_fourcc_be('N', 'T', '1', '2') /* Y/CbCr 4:2:0 10-bit 8x128 tiles */
++#define V4L2_PIX_FMT_NV12M_AMLOGIC_M6 v4l2_fourcc('A', 'M', '1', '2') /* 12  Y/CbCr 4:2:0 Amlogic M6 native byte order */
+ 
+ /* Bayer formats - see http://www.siliconimaging.com/RGB%20Bayer.htm */
+ #define V4L2_PIX_FMT_SBGGR8  v4l2_fourcc('B', 'A', '8', '1') /*  8  BGBG.. GRGR.. */
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -1372,6 +1372,7 @@
+ 	case V4L2_PIX_FMT_NV15_4L4:	descr = "10-bit Y/UV 4:2:0 (4x4 Linear)"; break;
+ 	case V4L2_PIX_FMT_P010_4L4:	descr = "10-bit Y/UV 4:2:0 (4x4 Linear)"; break;
+ 	case V4L2_PIX_FMT_NV12M:	descr = "Y/UV 4:2:0 (N-C)"; break;
++	case V4L2_PIX_FMT_NV12M_AMLOGIC_M6:	descr = "Y/UV 4:2:0 (Amlogic M6, N-C)"; break;
+ 	case V4L2_PIX_FMT_NV21M:	descr = "Y/VU 4:2:0 (N-C)"; break;
+ 	case V4L2_PIX_FMT_NV16M:	descr = "Y/UV 4:2:2 (N-C)"; break;
+ 	case V4L2_PIX_FMT_NV61M:	descr = "Y/VU 4:2:2 (N-C)"; break;
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -327,6 +327,12 @@
+ 	void *priv;
+ };
+ 
++static inline bool amvdec_is_nv12m(u32 pixfmt)
++{
++	return pixfmt == V4L2_PIX_FMT_NV12M ||
++	       pixfmt == V4L2_PIX_FMT_NV12M_AMLOGIC_M6;
++}
++
+ u32 amvdec_get_output_size(struct amvdec_session *sess);
+ 
+ #endif
+--- a/drivers/staging/media/meson/vdec/vdec_platform.c
++++ b/drivers/staging/media/meson/vdec/vdec_platform.c
+@@ -34,7 +34,8 @@
+ 		.vdec_ops = &vdec_1_ops,
+ 		.codec_ops = &codec_h264_ops,
+ 		.firmware_path = "meson/vdec/meson6_h264.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M,
++				 V4L2_PIX_FMT_NV12M_AMLOGIC_M6, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED |
+ 			 V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	}, {
+@@ -46,7 +47,9 @@
+ 		.vdec_ops = &vdec_1_ops,
+ 		.codec_ops = &codec_mpeg12_ops,
+ 		.firmware_path = "meson/vdec/meson6_mpeg12.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M,
++				 V4L2_PIX_FMT_NV12M_AMLOGIC_M6,
++				 V4L2_PIX_FMT_YUV420M, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED,
+ 	}, {
+ 		.pixfmt = V4L2_PIX_FMT_MPEG2,
+@@ -57,7 +60,9 @@
+ 		.vdec_ops = &vdec_1_ops,
+ 		.codec_ops = &codec_mpeg12_ops,
+ 		.firmware_path = "meson/vdec/meson6_mpeg12.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M,
++				 V4L2_PIX_FMT_NV12M_AMLOGIC_M6,
++				 V4L2_PIX_FMT_YUV420M, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED,
+ 	},
+ };
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -316,6 +316,7 @@
+ 		case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+ 			switch (sess->pixfmt_cap) {
+ 			case V4L2_PIX_FMT_NV12M:
++			case V4L2_PIX_FMT_NV12M_AMLOGIC_M6:
+ 				if (*num_planes != 2 ||
+ 				    sizes[0] < output_size ||
+ 				    sizes[1] < output_size / 2)
+@@ -347,6 +348,7 @@
+ 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+ 		switch (sess->pixfmt_cap) {
+ 		case V4L2_PIX_FMT_NV12M:
++		case V4L2_PIX_FMT_NV12M_AMLOGIC_M6:
+ 			sizes[0] = output_size;
+ 			sizes[1] = output_size / 2;
+ 			*num_planes = 2;
+@@ -684,7 +686,7 @@
+ 			pixmp->pixelformat = fmt_out->pixfmts_cap[0];
+ 
+ 		memset(pfmt[1].reserved, 0, sizeof(pfmt[1].reserved));
+-		if (pixmp->pixelformat == V4L2_PIX_FMT_NV12M) {
++		if (amvdec_is_nv12m(pixmp->pixelformat)) {
+ 			pfmt[0].sizeimage = output_size;
+ 			pfmt[0].bytesperline = ALIGN(pixmp->width, 32);
+ 
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -211,6 +211,7 @@
+ 
+ 		switch (pixfmt) {
+ 		case V4L2_PIX_FMT_NV12M:
++		case V4L2_PIX_FMT_NV12M_AMLOGIC_M6:
+ 			ret = set_canvas_nv12m(sess, &buf->vb.vb2_buf, width,
+ 					       height, reg_cur);
+ 			if (ret)
+@@ -287,6 +288,12 @@
+ /*
+  * Meson6: decoder-private picture planes (see struct amvdec_session).
+  */
++static inline bool amvdec_meson6_needs_copy(const struct amvdec_session *sess)
++{
++	return sess->core->platform->meson6 &&
++	       sess->pixfmt_cap != V4L2_PIX_FMT_NV12M_AMLOGIC_M6;
++}
++
+ static dma_addr_t amvdec_pic_paddr(struct amvdec_session *sess,
+ 				   struct vb2_buffer *vb, unsigned int plane)
+ {
+@@ -294,7 +301,7 @@
+ 	unsigned int idx = vb->index;
+ 	size_t size = vb2_plane_size(vb, plane);
+ 
+-	if (!sess->core->platform->meson6)
++	if (!amvdec_meson6_needs_copy(sess))
+ 		return vb2_dma_contig_plane_dma_addr(vb, plane);
+ 
+ 	if (sess->m6_vaddr[idx][plane] && sess->m6_size[idx][plane] != size) {
+@@ -455,6 +462,7 @@
+ 
+ 	switch (sess->pixfmt_cap) {
+ 	case V4L2_PIX_FMT_NV12M:
++	case V4L2_PIX_FMT_NV12M_AMLOGIC_M6:
+ 		vb2_set_plane_payload(&vbuf->vb2_buf, 0, output_size);
+ 		vb2_set_plane_payload(&vbuf->vb2_buf, 1, output_size / 2);
+ 		break;
+@@ -490,7 +498,7 @@
+ 	dev_dbg(dev, "Buffer %u done, ts = %llu, flags = %08X\n",
+ 		vbuf->vb2_buf.index, timestamp, flags);
+ 	vbuf->field = field;
+-	if (sess->core->platform->meson6) {
++	if (amvdec_meson6_needs_copy(sess)) {
+ 		struct amvdec_m6_copy *item = kmalloc(sizeof(*item), GFP_KERNEL);
+ 		unsigned long irqflags;
+ 
+--- a/drivers/staging/media/meson/vdec/vdec_1.c
++++ b/drivers/staging/media/meson/vdec/vdec_1.c
+@@ -249,7 +249,7 @@
+ 	amvdec_write_dos(core, ASSIST_MBOX1_MASK, 1);
+ 
+ 	/* Enable 2-plane output */
+-	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M)
++	if (amvdec_is_nv12m(sess->pixfmt_cap))
+ 		amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+ 	else
+ 		amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+--- a/drivers/staging/media/meson/vdec/codec_h264.c
++++ b/drivers/staging/media/meson/vdec/codec_h264.c
+@@ -604,7 +604,7 @@
+ 	amvdec_write_dos(core, AV_SCRATCH_F,
+ 			 (amvdec_read_dos(core, AV_SCRATCH_F) & 0xffffff83) |
+ 			 BIT(4));
+-	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M)
++	if (amvdec_is_nv12m(sess->pixfmt_cap))
+ 		amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+ 
+ 	amvdec_write_dos(core, ASSIST_MBOX1_CLR_REG, 1);
+--- a/drivers/staging/media/meson/vdec/codec_mpeg12.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+@@ -254,7 +254,7 @@
+ 	amvdec_write_dos(core, MREG_ERROR_COUNT, 0);
+ 	amvdec_write_dos(core, MREG_FATAL_ERROR, 0);
+ 	amvdec_write_dos(core, MREG_WAIT_BUFFER, 0);
+-	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M)
++	if (amvdec_is_nv12m(sess->pixfmt_cap))
+ 		amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+ 
+ 	amvdec_write_dos(core, ASSIST_MBOX1_MASK, 1);
