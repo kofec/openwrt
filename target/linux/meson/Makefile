@@ -9,7 +9,7 @@ BOARD:=meson
 BOARDNAME:=Amlogic Meson6 (AML8726-MX)
 FEATURES:=fpu usb ext4 squashfs boot-part rootfs-part targz
 CPU_TYPE:=cortex-a9
-CPU_SUBTYPE:=vfpv3-d16
+CPU_SUBTYPE:=neon
 SUBTARGETS:=generic
 
 KERNEL_PATCHVER:=6.12
