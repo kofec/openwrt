@@ -47,8 +47,21 @@ Working on the hardware:
   EDID, framebuffer console at 1080p60 (480p/576p, 720p/1080i and 1080p
   modes only, like the vendor kernel)
 - HDMI CEC (`/dev/cec0`): tested with a Sony TV (power status, OSD name,
-  Image View On, Standby — the TV only accepts Standby after Active Source)
+  Image View On, Standby — the TV only accepts Standby after Active Source;
+  includes RX stall recovery and automatic hardware reset on wedged RX)
 - audio over HDMI (ALSA card `WETEK-PLAY`, PCM device 1)
+- Mali-400 MP2 GPU through `lima` and Mesa (`libmesa-lima` and `kmscube`
+  from the `video` feed as packages): `kmscube` runs at ~60 fps with
+  cpufreq active. The OSD plane has no
+  XRGB8888, use `kmscube -f AR24 -D /dev/dri/card1` (lima is `card0`).
+- MPEG-1/2 and H.264 hardware decoding through the staging `meson-vdec`
+  V4L2 driver (`/dev/video0`, stateful decoder, `NM12` and zero-copy `AM12`
+  Meson6 native byte-order format) with the vendor microcodes in
+  `/lib/firmware/meson/vdec/` (`meson6_mpeg12.bin`, `meson6_h264.bin`)
+- zero-copy VD1 hardware video overlay (`meson_overlay_plane`) with Meson6
+  byte-order DRM modifiers (`SWAP64`, `SWAP64_TFF`, `SWAP64_BFF`) and
+  hardware bob deinterlacing for interlaced streams (verified at 1080i50/60
+  in Kodi via FFmpeg V4L2 DRMPRIME: ~14% CPU, 0% byte-swap copy)
 
 Added, still being verified:
 
@@ -58,17 +71,7 @@ Added, still being verified:
 - analog audio (I2S to the external DAC, PCM device 0) and the optical
   S/PDIF output: play fine, not listened to yet
 
-- Mali-400 MP2 GPU through `lima` and Mesa (`libmesa-lima` and `kmscube`
-  from the `video` feed as packages): `kmscube` runs at ~60 fps with
-  cpufreq active. The OSD plane has no
-  XRGB8888, use `kmscube -f AR24 -D /dev/dri/card1` (lima is `card0`).
-
-- MPEG-1/2 hardware decoding through the staging `meson-vdec` V4L2 driver
-  (`/dev/video0`, stateful decoder, NV12M/YUV420M) with the vendor microcode
-  in `/lib/firmware/meson/vdec/meson6_mpeg12.bin`; tested with `v4l2-ctl`
-  (`v4l-utils` package) on a 576p stream from a RAM-booted kernel
-
-Not supported: H.264 and other codecs, video output of decoded frames, NAND.
+Not supported: other video codecs (VC-1/HEVC/AV1), DVB tuners, NAND.
 
 ## What this branch adds
 
@@ -98,6 +101,13 @@ Meson6 device tree is removed upstream from 6.13 on):
 | `135-clk-meson-meson6-add-the-video-decoder-clocks.patch` | DOS and DOS parser gates, VDEC_1 clock |
 | `136-media-meson-vdec-add-Meson6-MPEG-1-2-support.patch` | Meson6 in the staging video decoder: same DOS/parser registers as GX at another base, no power domain, MPEG-1/2 with the vendor microcode |
 | `137-media-meson-vdec-swap-the-Meson6-pictures-through-pr.patch` | the Meson6 canvases cannot swap bytes: decode into private buffers and copy byte swapped (NEON) into the V4L2 buffers |
+| `138`–`141` | `meson-vdec` robustness: full stream drain on `V4L2_DEC_CMD_STOP`, no ESPARSER before power-on, Meson6 MPEG-1/2 firmware restart on fatal errors, EOS packet closing and Meson6 firmware CPU reset |
+| `142`, `143`, `147`, `149`, `152` | Meson6 CEC reliability: vendor-like IRQ handling, TX result read after frame time and only after BUSY, RX stall drain/recovery without sync cancel under `adap->lock`, acknowledge every counted frame |
+| `144`–`146`, `148`, `150`, `151` | Meson6 H.264 hardware decoding (`meson6_h264.bin`), vendor DPB sizing, safe ISR stop and drain watchdog, fatal-error firmware restart, byte-swap copy moved off the RT interrupt thread with cached planes |
+| `153-drm-meson-vd1-overlay-meson6.patch` | enable the VD1 hardware video overlay plane (`meson_overlay_plane`) on Meson6/Meson8 |
+| `155-drm-v4l2-meson6-byte-order.patch` | zero-copy Meson6 byte order: `V4L2_PIX_FMT_NV12M_AMLOGIC_M6` (`AM12`) + `DRM_FORMAT_MOD_AMLOGIC_MESON6_SWAP64`, bypassing private buffers and NEON copy |
+| `156-drm-meson-transwitch-hdmi-meson6-cec-hw-reset.patch` | automatic hardware reset of the Meson6 CEC controller when RX wedges (`status 0` with `NUM_MSG > 0`), preserving logical address |
+| `157-drm-meson-vd1-div0-and-bob-deinterlace.patch` | VD1 zero-size division-by-zero guard and hardware bob deinterlacing (`SWAP64_TFF`/`SWAP64_BFF` modifiers, half-height vertical scaler with `IT2P`/`IB2P` phases) |
 
 Target `target/linux/meson`:
 
@@ -105,8 +115,8 @@ Target `target/linux/meson`:
   GPIO via `gpio-mmio`, regulators, LEDs, IR, efuse, thermal zone, OPPs,
   VPU/HDMI/CEC, sound card with I2S, S/PDIF and HDMI, Mali GPU, video
   decoder)
-- the MPEG-1/2 decoder microcode in `base-files/lib/firmware/meson/vdec/`
-  (generated from `vmpeg12_mc.c` of the GPL vendor kernel)
+- the MPEG-1/2 and H.264 decoder microcodes in `base-files/lib/firmware/meson/vdec/`
+  (`meson6_mpeg12.bin`, `meson6_h264.bin`, generated from the GPL vendor kernel)
 - SD card image (`sdcard.img.gz`) and `sysupgrade.img.gz` with metadata,
   `platform.sh` for sysupgrade that keeps the configuration backup on the
   FAT partition
