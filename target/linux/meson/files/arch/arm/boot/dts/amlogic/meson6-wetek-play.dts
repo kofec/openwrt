@@ -587,6 +587,19 @@
 };
 
 /*
+ * L2 (PL310 r3p2): bez tej właściwości kontroler zamienia współdzielone
+ * transakcje „normal non-cacheable” (bufory dma_alloc_coherent dekodera, USB,
+ * karty, Ethernetu) na cache'owalne bez alokacji przy odczycie i write-through
+ * przy zapisie — binding: „on systems where this may cause DMA buffer
+ * corruption”. Vendor ustawia to samo (aux-share_override w DTD Meson6), a
+ * mainline w meson8.dtsi/meson8b.dtsi. AUX_CTRL 0x46060001 -> 0x46460001.
+ * Prefetch (vendor: instr + data, offset 6) celowo osobno.
+ */
+&L2 {
+	arm,shared-override;
+};
+
+/*
  * Sterownik zegarów Meson6 (łatka 0004): opisuje PLL-e i zegar CPU tak, jak
  * zostawił je U-Boot (tylko odczyt), i steruje bramkami urządzeń. Identyfikatory
  * zegarów wzięte z bindingu Meson8b.
