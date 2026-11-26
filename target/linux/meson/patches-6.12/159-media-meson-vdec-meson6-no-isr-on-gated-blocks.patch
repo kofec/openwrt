@@ -1,0 +1,146 @@
+From: kofec
+Subject: [PATCH] media: meson: vdec: Meson6 no interrupt handler on a gated DOS/parser
+
+The WeTek Play reset itself three times on 25-26.11 (after 18.9 h, 4.9 h
+and 1.6 h) while Enigma2 played TV through the decoder: no oops, no panic,
+the console stops and the 30 s hardware watchdog restarts the SoC. On
+Meson6 any access to a block with its clock off hangs the bus this way
+(seen before with the parser, Mali and the S/PDIF gates).
+
+vdec_stop_streaming() synchronises the mailbox interrupt before the
+firmware is stopped, and only clears core->cur_sess after vdec_poweroff()
+gated the DOS and parser clocks, so a mailbox interrupt in between still
+runs vdec_isr() and the codec writes ASSIST_MBOX1_CLR_REG. esparser_isr()
+has no guard at all and reads PARSER_INT_STATUS whenever the parser
+interrupt arrives, e.g. the start code of a fetch that already timed out
+("esparser: input parsing error").
+
+Track the clocks in core->hw_on: set after power on, cleared in
+vdec_poweroff() before the decoder stops; both handlers leave the
+registers alone without it. vdec_poweroff() then masks the parser
+interrupt (as the vendor esparser_release()) and waits for running
+handlers of both interrupts before the clocks go off.
+
+diff --git a/drivers/staging/media/meson/vdec/esparser.c b/drivers/staging/media/meson/vdec/esparser.c
+index 3ea9181..41c2d44 100644
+--- a/drivers/staging/media/meson/vdec/esparser.c
++++ b/drivers/staging/media/meson/vdec/esparser.c
+@@ -61,6 +61,10 @@ static irqreturn_t esparser_isr(int irq, void *dev)
+ 	int int_status;
+ 	struct amvdec_core *core = dev;
+ 
++	/* parser clock off: hands off its registers, see vdec_poweroff() */
++	if (!READ_ONCE(core->hw_on))
++		return IRQ_NONE;
++
+ 	int_status = amvdec_read_parser(core, PARSER_INT_STATUS);
+ 	amvdec_write_parser(core, PARSER_INT_STATUS, int_status);
+ 
+@@ -485,6 +489,18 @@ int esparser_power_up(struct amvdec_session *sess)
+ 	return 0;
+ }
+ 
++/*
++ * Like the vendor esparser_release(): mask the parser interrupt and wait
++ * for a running handler before the parser clock goes off. Called with
++ * core->hw_on already false, so a late interrupt stays away as well.
++ */
++void esparser_power_down(struct amvdec_core *core)
++{
++	amvdec_write_parser(core, PARSER_INT_ENABLE, 0);
++	amvdec_write_parser(core, PARSER_INT_STATUS, 0xffff);
++	synchronize_irq(core->esparser_irq);
++}
++
+ int esparser_init(struct platform_device *pdev, struct amvdec_core *core)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -501,6 +517,7 @@ int esparser_init(struct platform_device *pdev, struct amvdec_core *core)
+ 		dev_err(dev, "Failed requesting ESPARSER IRQ\n");
+ 		return ret;
+ 	}
++	core->esparser_irq = irq;
+ 
+ 	core->esparser_reset =
+ 		devm_reset_control_get_exclusive(dev, "esparser");
+diff --git a/drivers/staging/media/meson/vdec/esparser.h b/drivers/staging/media/meson/vdec/esparser.h
+index 9351e62..ddd8330 100644
+--- a/drivers/staging/media/meson/vdec/esparser.h
++++ b/drivers/staging/media/meson/vdec/esparser.h
+@@ -13,6 +13,7 @@
+ 
+ int esparser_init(struct platform_device *pdev, struct amvdec_core *core);
+ int esparser_power_up(struct amvdec_session *sess);
++void esparser_power_down(struct amvdec_core *core);
+ 
+ /**
+  * esparser_queue_eos() - write End Of Stream sequence to the ESPARSER
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 3df3c6f..b0bad9e 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -102,6 +102,7 @@ static int vdec_poweron(struct amvdec_session *sess)
+ 		goto disable_dos;
+ 
+ 	esparser_power_up(sess);
++	WRITE_ONCE(sess->core->hw_on, true);
+ 
+ 	return 0;
+ 
+@@ -234,6 +235,19 @@ static void vdec_poweroff(struct amvdec_session *sess)
+ 	if (codec_ops->drain)
+ 		codec_ops->drain(sess);
+ 
++	/*
++	 * No interrupt handler may touch the DOS or parser registers once their
++	 * clocks are off: on Meson6 such an access hangs the bus and the
++	 * watchdog resets the SoC without a message (three resets 25-26.11 while
++	 * Enigma2 played TV and zapped). vdec_stop_streaming() synchronises the
++	 * mailbox interrupt before the firmware is stopped, and esparser_isr()
++	 * was never guarded; the vendor driver masks and frees both interrupts
++	 * before it stops the decoder.
++	 */
++	WRITE_ONCE(sess->core->hw_on, false);
++	esparser_power_down(sess->core);
++	synchronize_irq(sess->core->irq);
++
+ 	vdec_ops->stop(sess);
+ 	clk_disable_unprepare(sess->core->dos_clk);
+ 	clk_disable_unprepare(sess->core->dos_parser_clk);
+@@ -1131,7 +1145,8 @@ static irqreturn_t vdec_isr(int irq, void *data)
+ 	struct amvdec_core *core = data;
+ 	struct amvdec_session *sess = READ_ONCE(core->cur_sess);
+ 
+-	if (!sess)
++	/* clocks off (vdec_poweroff()): hands off the DOS registers */
++	if (!sess || !READ_ONCE(core->hw_on))
+ 		return IRQ_HANDLED;
+ 
+ 	sess->last_irq_jiffies = get_jiffies_64();
+@@ -1144,7 +1159,7 @@ static irqreturn_t vdec_threaded_isr(int irq, void *data)
+ 	struct amvdec_core *core = data;
+ 	struct amvdec_session *sess = READ_ONCE(core->cur_sess);
+ 
+-	if (!sess || READ_ONCE(sess->isr_stop))
++	if (!sess || READ_ONCE(sess->isr_stop) || !READ_ONCE(core->hw_on))
+ 		return IRQ_HANDLED;
+ 
+ 	return sess->fmt_out->codec_ops->threaded_isr(sess);
+diff --git a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+index ae09ee9..99f7ad5 100644
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -92,6 +92,13 @@ struct amvdec_core {
+ 	struct amvdec_session *cur_sess;
+ 	struct mutex lock;
+ 	int irq;
++	/* esparser interrupt, synchronised in vdec_poweroff() */
++	int esparser_irq;
++	/*
++	 * DOS and parser clocks on: only then may the interrupt handlers touch
++	 * their registers (Meson6 hangs the bus on a gated block).
++	 */
++	bool hw_on;
+ };
+ 
+ /**
