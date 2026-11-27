@@ -593,10 +593,17 @@
  * przy zapisie — binding: „on systems where this may cause DMA buffer
  * corruption”. Vendor ustawia to samo (aux-share_override w DTD Meson6), a
  * mainline w meson8.dtsi/meson8b.dtsi. AUX_CTRL 0x46060001 -> 0x46460001.
- * Prefetch (vendor: instr + data, offset 6) celowo osobno.
+ *
+ * Prefetch danych i instrukcji jak vendor (aux-data_prefetch,
+ * aux-instruction_prefetch); offset 7 jak mainline Meson8 (vendor: 6).
+ * Bez double linefill i prefetch-drop (vendor ich domyślnie nie włącza);
+ * erratum 752271 dotyczy dopiero r3p0-r3p1, tu r3p2.
  */
 &L2 {
 	arm,shared-override;
+	prefetch-data = <1>;
+	prefetch-instr = <1>;
+	arm,prefetch-offset = <7>;
 };
 
 /*
