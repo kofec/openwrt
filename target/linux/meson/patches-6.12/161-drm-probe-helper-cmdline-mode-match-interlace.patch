@@ -1,0 +1,32 @@
+From: kofec
+Subject: [PATCH] drm/probe-helper: match the interlace flag of a video= mode
+
+drm_helper_probe_add_cmdline_mode() marks the first probed mode with the
+size and refresh of video= as USERDEF, whether interlaced or not. With
+video=HDMI-A-1:1920x1080@50 the WeTek Play on a projector whose EDID lists
+1080i50 (VIC 20) before 1080p50 (VIC 31) came up in 1080i50, although
+the command line has no "i": drm_connector_pick_cmdline_mode() returns a
+USERDEF mode before its own interlace-aware search. The Meson6 OSD does
+not handle an interlaced output (the GUI came out stretched and cut off),
+and 50 Hz progressive was the point.
+
+Skip probed modes whose interlace flag differs from the command line.
+
+--- a/drivers/gpu/drm/drm_probe_helper.c
++++ b/drivers/gpu/drm/drm_probe_helper.c
+@@ -163,6 +163,15 @@
+ 				continue;
+ 		}
+ 
++		/*
++		 * 1920x1080i50 and 1920x1080p50 share size and refresh: without
++		 * an "i" in video= only a progressive mode may match, or the
++		 * first one in EDID order wins (an interlaced one on many sinks).
++		 */
++		if (!!(mode->flags & DRM_MODE_FLAG_INTERLACE) !=
++		    cmdline_mode->interlace)
++			continue;
++
+ 		/* Mark the matching mode as being preferred by the user */
+ 		mode->type |= DRM_MODE_TYPE_USERDEF;
+ 		return 0;
