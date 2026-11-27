@@ -1,0 +1,116 @@
+From: kofec
+Subject: [PATCH] usb: dwc2: Meson6 host port suspend without stopping the clocks
+
+On the WeTek Play (Meson6) port B carries the internal GL850G hub. When the
+hub runtime-suspends, dwc2 puts the port into suspend and gates the clocks
+(PCGCTL STOPPCLK and GATEHCLK, power_down NONE). Every resume then ended in
+a reset of the hub and the devices behind it ("reset high-speed USB device"
+for 2-1 and 2-1.2, ~1 s, partitions re-read). Devices directly on port A
+resumed fine. Keeping both controllers awake did not help, neither did a
+5 ms PHY clock settle time after ungating (as the vendor dwc_otg does).
+
+Measured on the box, hub suspend + resume of the stick behind it:
+- stock: reset every time, ~1 s
+- port suspended, clocks left running: no reset, 0.20 s
+- no_clock_gating (port not suspended at all): no reset, 0.11 s,
+  but the hub can then not signal remote wakeup.
+
+Add host_suspend_keep_clocks and a meson6 compatible that sets it: the
+port is suspended (HPRT0_SUSP) and resumed as before, only the PCGCTL
+gating is skipped. A sleeping hub costs no SOF interrupts; awake it takes
+~8000 per second, ~9 % of CPU0.
+
+diff --git a/drivers/usb/dwc2/core.h b/drivers/usb/dwc2/core.h
+index 2bd74f3..f731dc2 100644
+--- a/drivers/usb/dwc2/core.h
++++ b/drivers/usb/dwc2/core.h
+@@ -366,6 +366,11 @@ enum dwc2_ep0_state {
+  * @no_clock_gating:	Specifies whether to avoid clock gating feature.
+  *			0 - No (use clock gating)
+  *			1 - Yes (avoid it)
++ * @host_suspend_keep_clocks: Suspend a host port without stopping the PHY
++ *			clock and gating HCLK (PCGCTL), when the port does
++ *			not resume after that.
++ *			0 - No (stop them, default)
++ *			1 - Yes (keep them running)
+  * @lpm:		Enable LPM support.
+  *			0 - No
+  *			1 - Yes
+@@ -465,6 +470,7 @@ struct dwc2_core_params {
+ #define DWC2_POWER_DOWN_PARAM_PARTIAL		1
+ #define DWC2_POWER_DOWN_PARAM_HIBERNATION	2
+ 	bool no_clock_gating;
++	bool host_suspend_keep_clocks;
+ 
+ 	bool lpm;
+ 	bool lpm_clock_gating;
+diff --git a/drivers/usb/dwc2/debugfs.c b/drivers/usb/dwc2/debugfs.c
+index 3116ac7..33fa136 100644
+--- a/drivers/usb/dwc2/debugfs.c
++++ b/drivers/usb/dwc2/debugfs.c
+@@ -703,6 +703,7 @@ static int params_show(struct seq_file *seq, void *v)
+ 	print_param(seq, p, external_id_pin_ctl);
+ 	print_param(seq, p, power_down);
+ 	print_param(seq, p, no_clock_gating);
++	print_param(seq, p, host_suspend_keep_clocks);
+ 	print_param(seq, p, lpm);
+ 	print_param(seq, p, lpm_clock_gating);
+ 	print_param(seq, p, besl);
+diff --git a/drivers/usb/dwc2/hcd.c b/drivers/usb/dwc2/hcd.c
+index 938b646..db8c0df 100644
+--- a/drivers/usb/dwc2/hcd.c
++++ b/drivers/usb/dwc2/hcd.c
+@@ -5925,6 +5925,9 @@ void dwc2_host_enter_clock_gating(struct dwc2_hsotg *hsotg)
+ 	hprt0 |= HPRT0_SUSP;
+ 	dwc2_writel(hsotg, hprt0, HPRT0);
+ 
++	if (hsotg->params.host_suspend_keep_clocks)
++		goto suspended;
++
+ 	/* Set the Phy Clock bit as suspend is received. */
+ 	pcgctl = dwc2_readl(hsotg, PCGCTL);
+ 	pcgctl |= PCGCTL_STOPPCLK;
+@@ -5937,6 +5940,8 @@ void dwc2_host_enter_clock_gating(struct dwc2_hsotg *hsotg)
+ 	dwc2_writel(hsotg, pcgctl, PCGCTL);
+ 	udelay(5);
+ 
++suspended:
++
+ 	hsotg->bus_suspended = true;
+ 	hsotg->lx_state = DWC2_L2;
+ }
+diff --git a/drivers/usb/dwc2/params.c b/drivers/usb/dwc2/params.c
+index 4d73fae..9125bd8 100644
+--- a/drivers/usb/dwc2/params.c
++++ b/drivers/usb/dwc2/params.c
+@@ -182,6 +182,21 @@ static void dwc2_set_amlogic_params(struct dwc2_hsotg *hsotg)
+ 	p->power_down = DWC2_POWER_DOWN_PARAM_NONE;
+ }
+ 
++/*
++ * Meson6 (AML8726-MX): port B, which carries the internal GL850G hub of the
++ * WeTek Play, does not come back from host clock gating. Every resume of
++ * the suspended hub ended in a reset of the hub and the devices behind it
++ * (~1 s, partitions re-read), also with a 5 ms PHY clock settle time like
++ * the vendor dwc_otg. Suspending the port with the clocks running resumes
++ * cleanly in ~0.2 s, keeps remote wakeup and costs no SOF interrupts while
++ * the hub sleeps (an awake hub: ~8000 per second, ~9 % of a CPU).
++ */
++static void dwc2_set_amlogic_meson6_params(struct dwc2_hsotg *hsotg)
++{
++	dwc2_set_amlogic_params(hsotg);
++	hsotg->params.host_suspend_keep_clocks = true;
++}
++
+ static void dwc2_set_amlogic_g12a_params(struct dwc2_hsotg *hsotg)
+ {
+ 	struct dwc2_core_params *p = &hsotg->params;
+@@ -322,6 +337,8 @@ const struct of_device_id dwc2_of_match_table[] = {
+ 	{ .compatible = "snps,dwc2" },
+ 	{ .compatible = "samsung,s3c6400-hsotg",
+ 	  .data = dwc2_set_s3c6400_params },
++	{ .compatible = "amlogic,meson6-usb",
++	  .data = dwc2_set_amlogic_meson6_params },
+ 	{ .compatible = "amlogic,meson8-usb",
+ 	  .data = dwc2_set_amlogic_params },
+ 	{ .compatible = "amlogic,meson8b-usb",

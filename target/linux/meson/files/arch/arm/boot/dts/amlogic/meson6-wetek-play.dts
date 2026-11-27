@@ -737,8 +737,12 @@
 	status = "okay";
 };
 
+/*
+ * amlogic,meson6-usb (łatka 160): port usypiany bez zatrzymywania zegarów
+ * PHY/HCLK - po bramkowaniu hub GL850G na porcie B nie wracał bez resetu.
+ */
 &usb0 {
-	compatible = "amlogic,meson8-usb", "snps,dwc2";
+	compatible = "amlogic,meson6-usb", "amlogic,meson8-usb", "snps,dwc2";
 	clocks = <&clkc CLKID_USB0_DDR_BRIDGE>;
 	clock-names = "otg";
 	status = "okay";
@@ -754,7 +758,7 @@
 };
 
 &usb1 {
-	compatible = "amlogic,meson8-usb", "snps,dwc2";
+	compatible = "amlogic,meson6-usb", "amlogic,meson8-usb", "snps,dwc2";
 	clocks = <&clkc CLKID_USB1_DDR_BRIDGE>;
 	clock-names = "otg";
 	status = "okay";
