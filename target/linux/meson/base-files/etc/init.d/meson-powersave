@@ -2,8 +2,13 @@
 # WeTek Play: keep the box cool when idle.
 # - CPU up to 792 MHz: VCCK stays at 1.01 V (1.24-1.32 V above); without a
 #   heatsink the SoC reached the 110 C critical trip under load
-# - USB and disks autosuspend: an awake dwc2 port raises ~8000 SOF
-#   interrupts per second and the CPU never idles
+# - USB devices and hubs autosuspend: an awake hub makes dwc2 raise ~8000
+#   SOF interrupts per second, ~9 % of CPU0 and ~2 C (measured with the
+#   cores idling in WFI). The internal hub on port B resumes cleanly only
+#   with patch 160 (port suspended without clock gating): ~0.2 s instead
+#   of a hub and device reset.
+# - Disks after 60 s idle, not 2 s: a mounted stick does not go to sleep
+#   between every few reads.
 
 START=99
 
@@ -18,7 +23,7 @@ start() {
 	done
 	for p in /sys/block/sd*/device/power; do
 		[ -d "$p" ] || continue
-		echo 2000 > "$p/autosuspend_delay_ms"
+		echo 60000 > "$p/autosuspend_delay_ms"
 		echo auto > "$p/control"
 	done
 }

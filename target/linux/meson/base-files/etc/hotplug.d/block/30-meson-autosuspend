@@ -1,8 +1,8 @@
-# disks plugged later: autosuspend after 2 s idle (see meson-powersave)
+# disks plugged later: autosuspend after 60 s idle (see meson-powersave)
 [ "$ACTION" = add ] || exit 0
 case "$DEVNAME" in sd[a-z]) ;; *) exit 0 ;; esac
 p=/sys/block/$DEVNAME/device/power
 [ -d "$p" ] || exit 0
-echo 2000 > "$p/autosuspend_delay_ms"
+echo 60000 > "$p/autosuspend_delay_ms"
 echo auto > "$p/control"
 exit 0
