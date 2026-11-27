@@ -1,0 +1,97 @@
+CONFIG_TARGET_meson=y
+CONFIG_TARGET_meson_generic=y
+CONFIG_TARGET_meson_generic_DEVICE_wetek_play=y
+CONFIG_TARGET_KERNEL_PARTSIZE=64
+# CONFIG_TARGET_ROOTFS_EXT4FS is not set
+CONFIG_TARGET_ROOTFS_PARTSIZE=4096
+
+# Hardware & kernel options
+CONFIG_BRCMFMAC_SDIO=y
+CONFIG_BUILD_PATENTED=y
+# CONFIG_MESA_USE_LLVM is not set
+CONFIG_KERNEL_HARDLOCKUP_DETECTOR=y
+CONFIG_KERNEL_SOFTLOCKUP_DETECTOR=y
+
+# OpenSSL stack (replacing mbedtls)
+# CONFIG_PACKAGE_apk-mbedtls is not set
+CONFIG_PACKAGE_apk-openssl=y
+# CONFIG_PACKAGE_libmbedtls is not set
+# CONFIG_PACKAGE_libustream-mbedtls is not set
+CONFIG_PACKAGE_libustream-openssl=y
+# CONFIG_PACKAGE_wpad-basic-mbedtls is not set
+CONFIG_PACKAGE_wpad-openssl=y
+CONFIG_LIBCURL_OPENSSL=y
+CONFIG_PACKAGE_libopenssl-legacy=y
+CONFIG_PACKAGE_ca-certificates=y
+
+# SSH & legacy device compatibility (nBox / older dropbear + SFTP)
+CONFIG_DROPBEAR_ECDSA=y
+CONFIG_PACKAGE_openssh-client=y
+CONFIG_PACKAGE_openssh-sftp-server=y
+
+# Media stack: FFmpeg (VD1 DRMPRIME), Kodi 21.3, Enigma2, HDMI Launcher
+CONFIG_PACKAGE_ffmpeg=y
+CONFIG_PACKAGE_libffmpeg-full=y
+CONFIG_PACKAGE_kodi=y
+CONFIG_PACKAGE_kodi-pvr-vuplus=y
+CONFIG_PACKAGE_enigma2=y
+CONFIG_PACKAGE_enigma2-plugin-openwebif=y
+CONFIG_PACKAGE_enigma2-skin-pli-fullnighthd=y
+CONFIG_PACKAGE_hdmi-launcher=y
+CONFIG_PACKAGE_kmscube=m
+CONFIG_PACKAGE_edid-decode=y
+CONFIG_PACKAGE_v4l-utils=y
+
+# SQLite3 features required by Kodi
+CONFIG_SQLITE3_COLUMN_METADATA=y
+CONFIG_SQLITE3_DYNAMIC_EXTENSIONS=y
+CONFIG_SQLITE3_FTS3=y
+CONFIG_SQLITE3_FTS4=y
+CONFIG_SQLITE3_FTS5=y
+CONFIG_SQLITE3_RTREE=y
+CONFIG_PCRE2_JIT_ENABLED=y
+
+# Audio & Bluetooth
+CONFIG_PACKAGE_alsa-utils=y
+CONFIG_PACKAGE_bluez-daemon=y
+CONFIG_PACKAGE_bluez-utils=y
+CONFIG_PACKAGE_bluez-utils-extra=y
+CONFIG_PACKAGE_kmod-bluetooth=y
+
+# LuCI & collectd/rrdtool1 (used by hdmi-launcher charts)
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-app-statistics=y
+CONFIG_PACKAGE_collectd-mod-cpu=y
+CONFIG_PACKAGE_collectd-mod-cpufreq=y
+CONFIG_PACKAGE_collectd-mod-interface=y
+CONFIG_PACKAGE_collectd-mod-iwinfo=y
+CONFIG_PACKAGE_collectd-mod-load=y
+CONFIG_PACKAGE_collectd-mod-memory=y
+CONFIG_PACKAGE_collectd-mod-sensors=y
+CONFIG_PACKAGE_collectd-mod-thermal=y
+CONFIG_PACKAGE_lm-sensors=y
+CONFIG_PACKAGE_ttyd=y
+
+# USB storage, filesystems & network shares (NFS / SMB)
+CONFIG_PACKAGE_block-mount=y
+CONFIG_PACKAGE_blkid=y
+CONFIG_PACKAGE_kmod-usb-storage=y
+CONFIG_PACKAGE_kmod-usb-storage-uas=y
+CONFIG_PACKAGE_kmod-fs-ext4=y
+CONFIG_PACKAGE_kmod-fs-vfat=y
+CONFIG_PACKAGE_kmod-fs-exfat=y
+CONFIG_PACKAGE_kmod-fs-cifs=y
+CONFIG_PACKAGE_kmod-fs-nfs=y
+CONFIG_PACKAGE_kmod-fs-nfs-v3=y
+CONFIG_PACKAGE_kmod-fs-nfs-v4=y
+CONFIG_PACKAGE_nfs-utils=y
+
+# CLI utilities & BusyBox QoL
+CONFIG_BUSYBOX_CUSTOM=y
+CONFIG_BUSYBOX_CONFIG_FEATURE_EDITING_HISTORY=512
+CONFIG_BUSYBOX_CONFIG_FEATURE_REVERSE_SEARCH=y
+CONFIG_BUSYBOX_CONFIG_TIMEOUT=y
+CONFIG_PACKAGE_curl=y
+CONFIG_PACKAGE_htop=y
+CONFIG_HTOP_LMSENSORS=y
+CONFIG_PACKAGE_nano=y

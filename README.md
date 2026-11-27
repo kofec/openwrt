@@ -126,6 +126,8 @@ Target `target/linux/meson`:
 
 ## Build
 
+### Minimal image (OpenWrt base only)
+
 ```sh
 git clone -b wetek-play-25.12 https://github.com/kofec/openwrt.git openwrt-wetek
 cd openwrt-wetek
@@ -135,6 +137,27 @@ CONFIG_TARGET_meson=y
 CONFIG_TARGET_meson_generic=y
 CONFIG_TARGET_meson_generic_DEVICE_wetek_play=y
 EOF
+make defconfig
+make -j"$(nproc)"
+```
+
+### Full media image (Kodi 21.3-Omega, OpenPLi Enigma2, HDMI Launcher, VD1 FFmpeg)
+
+The media packages live in the companion feed [`kofec/openwrt-wetek-packages`](https://github.com/kofec/openwrt-wetek-packages) (`25.12` branch). Building Kodi additionally requires **OpenJDK 17 or 21** (`openjdk-21-jre-headless`) on the build host.
+
+Make sure `feeds.conf.default` lists the `wetek` feed **first** (before `packages`, so the patched `ffmpeg` with Meson6 VD1 `v4l2-drmprime` overrides upstream automatically):
+
+```text
+src-git wetek https://github.com/kofec/openwrt-wetek-packages.git;25.12
+```
+
+Then build using the included `wetek-play.diffconfig`:
+
+```sh
+git clone -b wetek-play-25.12 https://github.com/kofec/openwrt.git openwrt-wetek
+cd openwrt-wetek
+./scripts/feeds update -a && ./scripts/feeds install -a
+cp wetek-play.diffconfig .config
 make defconfig
 make -j"$(nproc)"
 ```
